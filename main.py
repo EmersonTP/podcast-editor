@@ -319,15 +319,42 @@ def run_export(job_id: str, approved_cuts, video_path: Path, make_clip: bool):
 async def home():
     return HTMLResponse(UI_HTML)
 
-@app.post("/upload")
-async def upload(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    job_id = uuid.uuid4().hex[:12]
-    ext = Path(file.filename).suffix or ".mp4"
+@app.post("/upload-chunk")
+async def upload_chunk(
+    request: Request,
+    job_id:      str = Form(...),
+    chunk_index: int = Form(...),
+    total_chunks: int = Form(...),
+    filename:    str = Form(...),
+    background_tasks: BackgroundTasks = None,
+    chunk: UploadFile = File(...),
+):
+    """Recebe um chunk de arquivo. Quando todos chegarem, inicia o pipeline."""
+    chunk_dir = UPLOAD_DIR / f"{job_id}_chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_path = chunk_dir / f"chunk_{chunk_index:05d}"
+    async with aiofiles.open(chunk_path, "wb") as f:
+        await f.write(await chunk.read())
+
+    # Verificar se todos os chunks chegaram
+    received = len(list(chunk_dir.glob("chunk_*")))
+    if received < total_chunks:
+        return JSONResponse({"ok": True, "received": received, "total": total_chunks})
+
+    # Todos os chunks recebidos — montar arquivo final
+    ext = Path(filename).suffix or ".mp4"
     video_path = UPLOAD_DIR / f"{job_id}{ext}"
 
-    async with aiofiles.open(video_path, "wb") as f:
-        content = await file.read()
-        await f.write(content)
+    async with aiofiles.open(video_path, "wb") as out:
+        for i in range(total_chunks):
+            cp = chunk_dir / f"chunk_{i:05d}"
+            async with aiofiles.open(cp, "rb") as inp:
+                await out.write(await inp.read())
+
+    # Limpar chunks
+    import shutil
+    shutil.rmtree(chunk_dir, ignore_errors=True)
 
     # Pegar duração via ffprobe
     try:
@@ -336,9 +363,64 @@ async def upload(background_tasks: BackgroundTasks, file: UploadFile = File(...)
             "-show_streams", str(video_path)
         ], capture_output=True, text=True)
         info = json.loads(result.stdout)
+        streams = info.get("streams", [])
+        # Tenta pegar de vídeo primeiro, depois áudio
+        duration = 0.0
+        for s in streams:
+            d = s.get("duration")
+            if d:
+                duration = float(d)
+                break
+    except:
+        duration = 0.0
+
+    _update(job_id,
+        status="uploaded",
+        progress=8,
+        msg="Arquivo recebido. Iniciando transcrição...",
+        filename=filename,
+        video_path=str(video_path),
+        duration=duration,
+        created_at=datetime.now().isoformat(),
+    )
+
+    background_tasks.add_task(process_job, job_id, video_path, duration)
+    return JSONResponse({"ok": True, "assembled": True, "job_id": job_id})
+
+@app.post("/upload-init")
+async def upload_init(request: Request):
+    """Cria job_id antes de começar os chunks."""
+    body = await request.json()
+    job_id = uuid.uuid4().hex[:12]
+    _update(job_id,
+        status="pending",
+        progress=0,
+        msg="Aguardando chunks...",
+        filename=body.get("filename", ""),
+        created_at=datetime.now().isoformat(),
+    )
+    return JSONResponse({"job_id": job_id})
+
+@app.post("/upload")
+async def upload(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Fallback para upload simples (compatibilidade)."""
+    job_id = uuid.uuid4().hex[:12]
+    ext = Path(file.filename).suffix or ".mp4"
+    video_path = UPLOAD_DIR / f"{job_id}{ext}"
+
+    async with aiofiles.open(video_path, "wb") as f:
+        content = await file.read()
+        await f.write(content)
+
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", str(video_path)
+        ], capture_output=True, text=True)
+        info = json.loads(result.stdout)
         duration = float(next(
-            s["duration"] for s in info["streams"]
-            if s.get("codec_type") == "video"
+            (s["duration"] for s in info.get("streams", []) if s.get("duration")),
+            0.0
         ))
     except:
         duration = 0.0
@@ -475,548 +557,1708 @@ UI_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Podcast Editor</title>
+<title>Podcast Editor — Emerson</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;800&display=swap');
-  :root{
-    --red:#FC3D21;--black:#0A0A0A;--white:#FFFFFF;
-    --gray1:#F5F5F5;--gray2:#E5E5E5;--gray3:#999;--gray4:#555;
-  }
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{background:var(--black);color:var(--white);font-family:'DM Sans',sans-serif;min-height:100vh}
-  @keyframes fadeUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
-  @keyframes spin{to{transform:rotate(360deg)}}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@font-face {
+  font-family: 'Sohne';
+  src: url('https://fonts.cdnfonts.com/s/15179/TestSohne-Buch.woff') format('woff');
+  font-weight: 400; font-style: normal;
+}
+@font-face {
+  font-family: 'Sohne';
+  src: url('https://fonts.cdnfonts.com/s/15179/TestSohne-Halbfett.woff') format('woff');
+  font-weight: 600; font-style: normal;
+}
+@font-face {
+  font-family: 'Sohne';
+  src: url('https://fonts.cdnfonts.com/s/15179/TestSohne-Dreiviertelfett.woff') format('woff');
+  font-weight: 700; font-style: normal;
+}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap');
 
-  /* NAV */
-  nav{display:flex;align-items:center;gap:16px;padding:20px 48px;border-bottom:1px solid #1A1A1A;position:sticky;top:0;background:rgba(10,10,10,.95);backdrop-filter:blur(8px);z-index:100}
-  .nav-logo{font-size:18px;font-weight:800;letter-spacing:-.03em}
-  .nav-logo span{color:var(--red)}
-  .nav-badge{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--gray3);border:1px solid #2A2A2A;padding:4px 10px;border-radius:2px}
-  nav .spacer{flex:1}
-  .jingle-btn{font-size:12px;color:var(--gray3);background:none;border:1px solid #2A2A2A;padding:8px 16px;cursor:pointer;font-family:inherit;transition:all .2s}
-  .jingle-btn:hover{border-color:var(--gray3);color:var(--white)}
+:root {
+  --coral:   #FD7D59;
+  --purple:  #924FAC;
+  --black:   #080808;
+  --ink:     #0D0D0D;
+  --panel:   #111111;
+  --border:  #1C1C1C;
+  --muted:   #2A2A2A;
+  --dim:     #555;
+  --mid:     #888;
+  --fog:     #AAAAAA;
+  --white:   #F2F0EC;
+  --green:   #3ECF8E;
+  --yellow:  #F5C518;
+  --sans: 'Sohne', 'DM Sans', sans-serif;
+  --mono: 'IBM Plex Mono', monospace;
+}
 
-  /* MAIN */
-  main{max-width:960px;margin:0 auto;padding:48px 24px}
+*, *::before, *::after { margin:0; padding:0; box-sizing:border-box }
+html { scroll-behavior:smooth }
+body {
+  background: var(--black);
+  color: var(--white);
+  font-family: var(--sans);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
 
-  /* UPLOAD ZONE */
-  .upload-zone{border:2px dashed #2A2A2A;padding:80px 40px;text-align:center;transition:all .3s;cursor:pointer;animation:fadeUp .6s both;position:relative}
-  .upload-zone:hover,.upload-zone.drag{border-color:var(--red);background:rgba(252,61,33,.04)}
-  .upload-zone input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
-  .upload-icon{font-size:48px;margin-bottom:24px;opacity:.4}
-  .upload-title{font-size:24px;font-weight:800;letter-spacing:-.03em;margin-bottom:8px}
-  .upload-sub{font-size:14px;color:var(--gray3)}
-  .upload-sub strong{color:var(--white)}
+/* NOISE */
+body::before {
+  content:'';
+  position:fixed; inset:0;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/%3E%3C/svg%3E");
+  pointer-events:none; z-index:9999; opacity:.5;
+}
 
-  /* PROGRESS */
-  #progress-section{display:none;animation:fadeUp .5s both}
-  .progress-card{background:#111;border:1px solid #1E1E1E;padding:32px;margin-bottom:24px}
-  .prog-header{display:flex;align-items:center;gap:16px;margin-bottom:24px}
-  .prog-spinner{width:24px;height:24px;border:2px solid #2A2A2A;border-top-color:var(--red);border-radius:50%;animation:spin 1s linear infinite;flex-shrink:0}
-  .prog-spinner.done{animation:none;border-color:var(--red);background:var(--red)}
-  .prog-title{font-size:16px;font-weight:700}
-  .prog-msg{font-size:13px;color:var(--gray3);margin-top:4px}
-  .prog-bar-wrap{background:#1A1A1A;height:4px;border-radius:2px;overflow:hidden}
-  .prog-bar{height:100%;background:var(--red);transition:width .5s ease;border-radius:2px}
-  .prog-pct{font-size:12px;color:var(--gray3);text-align:right;margin-top:8px}
+@keyframes fadeUp  { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+@keyframes fadeIn  { from{opacity:0} to{opacity:1} }
+@keyframes spin    { to{transform:rotate(360deg)} }
+@keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:.25} }
+@keyframes shimmer { from{background-position:-200% 0} to{background-position:200% 0} }
 
-  /* ANALYSIS */
-  #analysis-section{display:none;animation:fadeUp .5s both}
-  .section-title{font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--red);margin-bottom:20px}
+/* ─────────────────────────────────────────────
+   LOGIN SCREEN
+───────────────────────────────────────────── */
+#login-screen {
+  position:fixed; inset:0;
+  background:var(--black);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:800;
+  animation:fadeIn .4s both;
+}
 
-  /* EPISODE META */
-  .meta-card{background:#111;border:1px solid #1E1E1E;padding:28px;margin-bottom:20px}
-  .meta-title-big{font-size:22px;font-weight:800;letter-spacing:-.03em;margin-bottom:8px}
-  .meta-alts{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-  .meta-alt{font-size:12px;color:var(--gray3);border:1px solid #2A2A2A;padding:4px 12px;cursor:pointer;transition:all .2s}
-  .meta-alt:hover{border-color:var(--red);color:var(--white)}
-  .meta-body{font-size:14px;color:#888;line-height:1.7}
-  .meta-desc{font-size:13px;color:#666;line-height:1.7;margin-top:12px;padding-top:12px;border-top:1px solid #1A1A1A}
+.login-bg {
+  position:absolute; inset:0;
+  background: radial-gradient(ellipse 60% 60% at 50% 40%, rgba(146,79,172,.07) 0%, transparent 70%);
+  pointer-events:none;
+}
 
-  /* STATS BAR */
-  .stats-bar{display:flex;gap:24px;background:#0D0D0D;border:1px solid #1A1A1A;padding:20px 28px;margin-bottom:20px}
-  .stat{display:flex;flex-direction:column;gap:4px}
-  .stat-val{font-size:20px;font-weight:800;color:var(--white)}
-  .stat-val.red{color:var(--red)}
-  .stat-lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--gray3)}
+.login-box {
+  width:100%;
+  max-width:400px;
+  padding:0 24px;
+  animation:fadeUp .6s .1s both;
+  position:relative;
+  z-index:1;
+}
 
-  /* CLIP HIGHLIGHT */
-  .clip-card{background:rgba(252,61,33,.06);border:1px solid rgba(252,61,33,.2);padding:20px 24px;margin-bottom:20px;display:flex;align-items:center;gap:20px}
-  .clip-icon{font-size:28px;flex-shrink:0}
-  .clip-info{flex:1}
-  .clip-title{font-size:14px;font-weight:700;margin-bottom:4px}
-  .clip-sub{font-size:12px;color:var(--gray3)}
-  .clip-ts{font-size:13px;font-weight:700;color:var(--red);font-variant-numeric:tabular-nums}
+.login-logo {
+  margin-bottom:40px;
+  text-align:center;
+}
 
-  /* FRASE DESTAQUE */
-  .quote-card{background:#111;border-left:3px solid var(--red);padding:20px 24px;margin-bottom:20px}
-  .quote-text{font-size:16px;font-weight:700;letter-spacing:-.02em;line-height:1.5;margin-bottom:8px}
-  .quote-ts{font-size:12px;color:var(--gray3)}
+.login-logo img {
+  height:36px;
+  width:auto;
+  display:inline-block;
+}
 
-  /* CORTES */
-  .cuts-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-  .cuts-actions{display:flex;gap:8px}
-  .btn-sm{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:8px 16px;border:1px solid #2A2A2A;background:none;color:var(--gray3);cursor:pointer;font-family:inherit;transition:all .2s}
-  .btn-sm:hover{border-color:var(--white);color:var(--white)}
-  .btn-sm.red{background:var(--red);border-color:var(--red);color:var(--white)}
-  .btn-sm.red:hover{background:#E02E14}
+.login-heading {
+  font-size:24px;
+  font-weight:700;
+  letter-spacing:-.03em;
+  color:var(--white);
+  margin-bottom:6px;
+  text-align:center;
+}
 
-  .cut-item{display:flex;align-items:stretch;gap:0;margin-bottom:8px;border:1px solid #1E1E1E;transition:border-color .2s}
-  .cut-item:hover{border-color:#333}
-  .cut-item.approved{border-color:rgba(72,199,142,.3)}
-  .cut-item.removed{opacity:.35;border-color:#1A1A1A}
-  .cut-indicator{width:4px;flex-shrink:0}
-  .cut-indicator.manter{background:#48C78E}
-  .cut-indicator.cortar{background:var(--red)}
-  .cut-indicator.comprimir{background:#FFD166}
-  .cut-body{flex:1;padding:16px 20px}
-  .cut-top{display:flex;align-items:center;gap:12px;margin-bottom:6px}
-  .cut-type{font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 8px}
-  .cut-type.manter{background:rgba(72,199,142,.1);color:#48C78E}
-  .cut-type.cortar{background:rgba(252,61,33,.1);color:var(--red)}
-  .cut-type.comprimir{background:rgba(255,209,102,.1);color:#FFD166}
-  .cut-ts{font-size:13px;font-weight:700;color:var(--white);font-variant-numeric:tabular-nums}
-  .cut-dur{font-size:11px;color:var(--gray3)}
-  .cut-energia{font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:2px 8px;border-radius:1px}
-  .cut-energia.alta{background:rgba(252,61,33,.15);color:var(--red)}
-  .cut-energia.media{background:rgba(255,255,255,.06);color:var(--gray3)}
-  .cut-energia.baixa{background:rgba(255,255,255,.03);color:#444}
-  .cut-just{font-size:13px;color:#888;line-height:1.5}
-  .cut-actions{display:flex;align-items:center;gap:8px;padding:0 16px;flex-shrink:0}
-  .cut-toggle{width:32px;height:32px;border:1px solid #2A2A2A;background:none;color:var(--gray3);cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center;transition:all .2s;flex-shrink:0}
-  .cut-toggle:hover{border-color:var(--white);color:var(--white)}
-  .cut-toggle.active{background:var(--red);border-color:var(--red);color:var(--white)}
+.login-sub {
+  font-family:var(--mono);
+  font-size:11px;
+  letter-spacing:.1em;
+  text-transform:uppercase;
+  color:var(--dim);
+  text-align:center;
+  margin-bottom:36px;
+}
 
-  /* PROBLEMS */
-  .problem-item{display:flex;align-items:center;gap:12px;padding:10px 16px;background:#0D0D0D;border:1px solid #1A1A1A;margin-bottom:6px}
-  .prob-icon{font-size:16px;flex-shrink:0}
-  .prob-text{font-size:13px;color:#888;flex:1}
-  .prob-ts{font-size:12px;color:var(--red);font-weight:700;flex-shrink:0}
+.login-field {
+  margin-bottom:14px;
+}
 
-  /* CAPITULOS */
-  .chapter-item{display:flex;align-items:center;gap:16px;padding:10px 0;border-bottom:1px solid #1A1A1A}
-  .chap-ts{font-size:13px;font-weight:700;color:var(--red);font-variant-numeric:tabular-nums;width:60px;flex-shrink:0}
-  .chap-title{font-size:14px;color:var(--white)}
+.login-label {
+  display:block;
+  font-family:var(--mono);
+  font-size:9px;
+  letter-spacing:.18em;
+  text-transform:uppercase;
+  color:var(--dim);
+  margin-bottom:8px;
+}
 
-  /* EXPORT */
-  .export-card{background:#111;border:1px solid #1E1E1E;padding:28px;margin-top:24px}
-  .export-options{display:flex;align-items:center;gap:16px;margin-bottom:24px;flex-wrap:wrap}
-  .checkbox-label{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px;color:#888}
-  .checkbox-label input{accent-color:var(--red);width:15px;height:15px}
-  .btn-export{width:100%;padding:18px;background:var(--red);color:var(--white);font-family:inherit;font-weight:800;font-size:13px;letter-spacing:.1em;text-transform:uppercase;border:none;cursor:pointer;transition:background .2s}
-  .btn-export:hover{background:#E02E14}
-  .btn-export:disabled{opacity:.4;cursor:not-allowed}
+.login-input {
+  width:100%;
+  background:#0C0C0C;
+  border:1px solid var(--muted);
+  color:var(--white);
+  font-family:var(--sans);
+  font-size:15px;
+  padding:14px 16px;
+  outline:none;
+  transition:border-color .2s;
+  -webkit-appearance:none;
+}
 
-  /* DOWNLOADS */
-  #downloads-section{display:none;animation:fadeUp .5s both}
-  .downloads-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-top:20px}
-  .dl-card{background:#111;border:1px solid #1E1E1E;padding:24px;text-align:center;transition:border-color .2s}
-  .dl-card:hover{border-color:var(--red)}
-  .dl-icon{font-size:32px;margin-bottom:12px}
-  .dl-title{font-size:14px;font-weight:700;margin-bottom:4px}
-  .dl-sub{font-size:12px;color:var(--gray3);margin-bottom:16px}
-  .btn-dl{display:block;padding:10px;background:var(--red);color:var(--white);font-family:inherit;font-weight:700;font-size:11px;letter-spacing:.1em;text-transform:uppercase;border:none;cursor:pointer;text-decoration:none;transition:background .2s}
-  .btn-dl:hover{background:#E02E14}
+.login-input:focus { border-color:var(--coral) }
+.login-input::placeholder { color:var(--dim) }
 
-  /* JINGLE MODAL */
-  .modal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:1000;display:none;align-items:center;justify-content:center;padding:24px;backdrop-filter:blur(4px)}
-  .modal.open{display:flex}
-  .modal-box{background:#111;border:1px solid #2A2A2A;max-width:480px;width:100%;padding:40px;animation:fadeUp .3s both}
-  .modal-title{font-size:20px;font-weight:800;letter-spacing:-.03em;margin-bottom:8px}
-  .modal-sub{font-size:13px;color:var(--gray3);margin-bottom:28px}
-  .modal-close{float:right;background:none;border:none;color:var(--gray3);font-size:20px;cursor:pointer;margin-top:-8px}
-  .upload-field{margin-bottom:20px}
-  .upload-field label{display:block;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--gray3);margin-bottom:8px}
-  .upload-field input[type=file]{width:100%;background:#0D0D0D;border:1px solid #2A2A2A;color:var(--white);padding:12px;font-family:inherit;font-size:13px;cursor:pointer}
-  .btn-save{width:100%;padding:14px;background:var(--red);color:var(--white);font-family:inherit;font-weight:700;font-size:12px;letter-spacing:.1em;text-transform:uppercase;border:none;cursor:pointer;margin-top:8px}
+.login-error {
+  font-family:var(--mono);
+  font-size:11px;
+  color:#FF6B6B;
+  text-align:center;
+  min-height:18px;
+  margin-bottom:8px;
+}
 
-  /* TRANSCRIPT */
-  #transcript-section{display:none;animation:fadeUp .5s both;margin-top:24px}
-  .transcript-box{background:#0D0D0D;border:1px solid #1A1A1A;padding:24px;max-height:320px;overflow-y:auto;font-size:13px;line-height:1.8;color:#888;white-space:pre-wrap}
-  .transcript-box::-webkit-scrollbar{width:4px}
-  .transcript-box::-webkit-scrollbar-thumb{background:var(--red)}
+.login-btn {
+  width:100%;
+  padding:16px;
+  background:var(--coral);
+  color:#fff;
+  font-family:var(--sans);
+  font-weight:700;
+  font-size:14px;
+  letter-spacing:.02em;
+  border:none;
+  cursor:pointer;
+  margin-top:8px;
+  transition:all .2s;
+  position:relative;
+  overflow:hidden;
+}
+
+.login-btn::after {
+  content:'';
+  position:absolute; inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.1),transparent);
+  background-size:200% 100%;
+  opacity:0;
+  transition:opacity .2s;
+}
+
+.login-btn:hover { background:#e96a47 }
+.login-btn:hover::after { opacity:1; animation:shimmer 1s ease infinite }
+
+.login-divider {
+  border:none;
+  border-top:1px solid var(--border);
+  margin:28px 0;
+}
+
+.login-footer {
+  font-family:var(--mono);
+  font-size:10px;
+  color:var(--dim);
+  text-align:center;
+}
+
+/* ─────────────────────────────────────────────
+   APPROVAL SCREEN (aguardando autorização)
+───────────────────────────────────────────── */
+#approval-screen {
+  position:fixed; inset:0;
+  background:var(--black);
+  display:none;
+  align-items:center;
+  justify-content:center;
+  z-index:700;
+  flex-direction:column;
+  gap:0;
+}
+
+.approval-box {
+  width:100%;
+  max-width:480px;
+  padding:0 24px;
+  animation:fadeUp .6s both;
+  text-align:center;
+}
+
+.approval-icon {
+  width:64px; height:64px;
+  border:1px solid var(--muted);
+  border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  margin:0 auto 28px;
+  font-size:24px;
+  position:relative;
+}
+
+.approval-icon::after {
+  content:'';
+  position:absolute; inset:-6px;
+  border-radius:50%;
+  border:1px solid var(--border);
+  animation:pulse 2s ease infinite;
+}
+
+.approval-heading {
+  font-size:22px;
+  font-weight:700;
+  letter-spacing:-.03em;
+  color:var(--white);
+  margin-bottom:10px;
+}
+
+.approval-sub {
+  font-size:14px;
+  color:var(--mid);
+  line-height:1.6;
+  margin-bottom:32px;
+}
+
+.approval-user-badge {
+  display:inline-flex;
+  align-items:center;
+  gap:10px;
+  background:var(--panel);
+  border:1px solid var(--border);
+  padding:12px 20px;
+  margin-bottom:32px;
+}
+
+.badge-avatar {
+  width:32px; height:32px;
+  border-radius:50%;
+  background:var(--coral);
+  display:flex; align-items:center; justify-content:center;
+  font-size:13px;
+  font-weight:700;
+  color:#fff;
+  flex-shrink:0;
+}
+
+.badge-info { text-align:left }
+
+.badge-name {
+  font-size:13px;
+  font-weight:600;
+  color:var(--white);
+}
+
+.badge-role {
+  font-family:var(--mono);
+  font-size:10px;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:var(--dim);
+}
+
+.approval-actions {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+}
+
+.btn-approve {
+  padding:14px 20px;
+  background:var(--green);
+  color:#000;
+  font-family:var(--sans);
+  font-weight:700;
+  font-size:13px;
+  border:none;
+  cursor:pointer;
+  transition:all .2s;
+}
+
+.btn-approve:hover { background:#35b87d }
+
+.btn-deny {
+  padding:14px 20px;
+  background:none;
+  color:var(--mid);
+  font-family:var(--sans);
+  font-weight:600;
+  font-size:13px;
+  border:1px solid var(--muted);
+  cursor:pointer;
+  transition:all .2s;
+}
+
+.btn-deny:hover { border-color:var(--fog); color:var(--white) }
+
+.approval-pending-msg {
+  font-family:var(--mono);
+  font-size:11px;
+  letter-spacing:.08em;
+  text-transform:uppercase;
+  color:var(--dim);
+  margin-top:20px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+}
+
+.pending-dot {
+  width:6px; height:6px;
+  border-radius:50%;
+  background:var(--yellow);
+  animation:pulse 1.5s ease infinite;
+}
+
+/* ─────────────────────────────────────────────
+   TOPBAR
+───────────────────────────────────────────── */
+#topbar {
+  position:sticky; top:0; z-index:200;
+  background:rgba(8,8,8,.92);
+  backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:center;
+  height:52px; padding:0;
+}
+
+.topbar-logo {
+  display:flex; align-items:center;
+  padding:0 24px;
+  height:100%;
+  border-right:1px solid var(--border);
+  gap:10px;
+}
+
+.topbar-logo img { height:22px; width:auto }
+
+.topbar-sep {
+  width:1px; height:20px;
+  background:var(--muted);
+}
+
+.topbar-app {
+  font-family:var(--mono);
+  font-size:10px;
+  letter-spacing:.15em;
+  text-transform:uppercase;
+  color:var(--dim);
+}
+
+.topbar-spacer { flex:1 }
+
+.topbar-user {
+  display:flex; align-items:center;
+  gap:10px;
+  padding:0 20px;
+  border-left:1px solid var(--border);
+  height:100%;
+  cursor:pointer;
+}
+
+.user-avatar {
+  width:26px; height:26px;
+  border-radius:50%;
+  background:var(--coral);
+  display:flex; align-items:center; justify-content:center;
+  font-size:11px; font-weight:700; color:#fff;
+  flex-shrink:0;
+}
+
+.user-name {
+  font-size:12px;
+  font-weight:600;
+  color:var(--fog);
+}
+
+.btn-topbar {
+  font-family:var(--mono);
+  font-size:10px;
+  letter-spacing:.1em;
+  text-transform:uppercase;
+  color:var(--mid);
+  background:none;
+  border:1px solid var(--muted);
+  padding:6px 16px;
+  cursor:pointer;
+  margin-right:16px;
+  transition:all .2s;
+  white-space:nowrap;
+}
+
+.btn-topbar:hover { border-color:var(--coral); color:var(--white) }
+
+.topbar-status {
+  display:flex; align-items:center; gap:8px;
+  padding:0 20px;
+  border-left:1px solid var(--border);
+  height:100%;
+  font-family:var(--mono);
+  font-size:10px;
+  letter-spacing:.08em;
+  color:var(--dim);
+}
+
+.status-dot {
+  width:6px; height:6px;
+  border-radius:50%;
+  background:var(--dim);
+  flex-shrink:0;
+}
+
+.status-dot.live { background:var(--green); animation:pulse 2s ease infinite }
+
+/* ─────────────────────────────────────────────
+   APP LAYOUT
+───────────────────────────────────────────── */
+#app { max-width:1080px; margin:0 auto; padding:0 40px 80px }
+
+/* HERO */
+#hero { padding:64px 0 48px; animation:fadeUp .7s both }
+
+.hero-overline {
+  font-family:var(--mono);
+  font-size:10px; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--coral); margin-bottom:20px;
+  display:flex; align-items:center; gap:12px;
+}
+
+.hero-overline::before {
+  content:''; display:block;
+  width:28px; height:1px; background:var(--coral);
+}
+
+.hero-headline {
+  font-size:clamp(48px,6vw,76px);
+  font-weight:700;
+  letter-spacing:-.04em;
+  line-height:.92;
+  color:var(--white);
+  margin-bottom:24px;
+}
+
+.hero-headline span { color:var(--coral) }
+
+.hero-sub {
+  font-size:15px; color:var(--mid);
+  line-height:1.65; max-width:500px;
+  margin-bottom:48px;
+}
+
+/* UPLOAD ZONE */
+#upload-zone {
+  position:relative;
+  border:1px solid var(--muted);
+  background:var(--panel);
+  padding:72px 48px;
+  text-align:center;
+  cursor:pointer;
+  transition:all .3s ease;
+  overflow:hidden;
+}
+
+#upload-zone::before {
+  content:'';
+  position:absolute; inset:0;
+  background:linear-gradient(135deg,rgba(253,125,89,.07) 0%,transparent 60%);
+  opacity:0; transition:opacity .3s;
+}
+
+#upload-zone:hover, #upload-zone.drag {
+  border-color:var(--coral);
+  box-shadow:0 0 0 1px var(--coral), 0 24px 48px rgba(253,125,89,.06);
+  transform:translateY(-1px);
+}
+
+#upload-zone:hover::before, #upload-zone.drag::before { opacity:1 }
+
+#upload-zone input[type=file] {
+  position:absolute; inset:0;
+  opacity:0; cursor:pointer;
+  width:100%; height:100%;
+}
+
+.wave-viz {
+  display:flex; align-items:center; justify-content:center;
+  gap:3px; height:52px; margin-bottom:28px;
+}
+
+.w { width:3px; border-radius:2px; background:var(--muted); transition:background .3s }
+#upload-zone:hover .w { background:var(--coral) }
+
+.w:nth-child(1){height:8px}.w:nth-child(2){height:22px}.w:nth-child(3){height:38px}
+.w:nth-child(4){height:28px}.w:nth-child(5){height:52px}.w:nth-child(6){height:44px}
+.w:nth-child(7){height:52px}.w:nth-child(8){height:38px}.w:nth-child(9){height:30px}
+.w:nth-child(10){height:44px}.w:nth-child(11){height:22px}.w:nth-child(12){height:14px}
+.w:nth-child(13){height:8px}
+
+.upload-cta {
+  font-size:20px; font-weight:700;
+  letter-spacing:-.03em; color:var(--white);
+  margin-bottom:8px;
+}
+
+.upload-hint {
+  font-family:var(--mono); font-size:11px;
+  letter-spacing:.1em; text-transform:uppercase;
+  color:var(--dim);
+}
+
+.upload-hint strong { color:var(--fog) }
+
+/* PROCESSING */
+#processing-panel { display:none; padding:56px 0; animation:fadeIn .4s both }
+
+.proc-wrap {
+  display:grid;
+  grid-template-columns:88px 1fr;
+  gap:32px; align-items:start;
+  margin-bottom:40px;
+}
+
+.proc-num {
+  font-size:88px; font-weight:700;
+  letter-spacing:-.06em; line-height:1;
+  color:var(--border);
+  transition:color .5s; user-select:none;
+}
+
+.proc-num.lit { color:var(--coral) }
+
+.proc-meta { padding-top:8px }
+
+.proc-stage {
+  font-family:var(--mono);
+  font-size:9px; letter-spacing:.2em; text-transform:uppercase;
+  color:var(--coral); margin-bottom:10px;
+}
+
+.proc-title {
+  font-size:28px; font-weight:700;
+  letter-spacing:-.03em; color:var(--white);
+  margin-bottom:6px; line-height:1.1;
+}
+
+.proc-msg { font-size:13px; color:var(--mid); line-height:1.5 }
+
+.prog-track {
+  background:var(--border); height:1px;
+  position:relative; overflow:hidden;
+  margin-bottom:10px;
+}
+
+.prog-fill {
+  height:100%; background:var(--coral);
+  transition:width .6s ease; position:relative;
+}
+
+.prog-fill::after {
+  content:''; position:absolute;
+  right:0; top:-1px;
+  width:48px; height:3px;
+  background:linear-gradient(90deg,transparent,rgba(253,125,89,.5));
+}
+
+.prog-meta-row {
+  display:flex; justify-content:space-between;
+  font-family:var(--mono); font-size:10px; color:var(--dim);
+}
+
+.steps-list { border:1px solid var(--border); margin-top:28px }
+
+.step-item {
+  display:flex; align-items:center; gap:18px;
+  padding:14px 22px;
+  border-bottom:1px solid var(--border);
+  transition:background .2s;
+}
+
+.step-item:last-child { border-bottom:none }
+.step-item.active { background:rgba(253,125,89,.03) }
+.step-item.done   { opacity:.45 }
+
+.step-ico {
+  width:26px; height:26px;
+  border:1px solid var(--muted); border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  font-family:var(--mono); font-size:9px; color:var(--dim);
+  flex-shrink:0; transition:all .3s;
+}
+
+.step-ico.spinning { border-color:var(--coral); color:var(--coral); animation:spin 1.2s linear infinite }
+.step-ico.ok       { border-color:var(--green); color:var(--green); animation:none }
+
+.step-lbl { font-size:13px; color:var(--mid); flex:1 }
+.step-item.active .step-lbl { color:var(--white) }
+
+/* DIVIDER */
+.sec-div {
+  display:flex; align-items:center; gap:14px;
+  margin:44px 0 24px;
+}
+
+.sec-n { font-family:var(--mono); font-size:12px; color:var(--coral); min-width:20px }
+.sec-lbl { font-family:var(--mono); font-size:9px; letter-spacing:.2em; text-transform:uppercase; color:var(--dim); white-space:nowrap }
+.sec-line { flex:1; height:1px; background:var(--border) }
+
+/* ANALYSIS */
+#analysis-section { display:none; animation:fadeUp .6s both }
+
+/* Episode block */
+.ep-grid {
+  display:grid;
+  grid-template-columns:1fr 300px;
+  gap:2px; margin-bottom:2px;
+}
+
+.ep-main {
+  background:var(--panel); border:1px solid var(--border);
+  padding:32px 36px;
+}
+
+.ep-eyebrow {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.2em; text-transform:uppercase;
+  color:var(--coral); margin-bottom:14px;
+}
+
+.ep-title {
+  font-size:clamp(20px,2.5vw,30px);
+  font-weight:700; letter-spacing:-.03em;
+  line-height:1.1; color:var(--white);
+  margin-bottom:14px;
+}
+
+.ep-alts {
+  display:flex; flex-wrap:wrap; gap:6px; margin-bottom:18px;
+}
+
+.ep-alt {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.06em; color:var(--dim);
+  border:1px solid var(--muted); padding:4px 10px;
+  cursor:pointer; transition:all .2s;
+}
+
+.ep-alt:hover { border-color:var(--fog); color:var(--fog) }
+
+.ep-summary {
+  font-size:13px; color:var(--mid); line-height:1.7;
+  border-top:1px solid var(--border); padding-top:14px;
+}
+
+/* Stats panel */
+.stats-panel {
+  background:var(--coral); border:1px solid var(--coral);
+  padding:32px 28px;
+  display:flex; flex-direction:column; gap:0;
+}
+
+.stats-head {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.2em; text-transform:uppercase;
+  color:rgba(0,0,0,.4); margin-bottom:20px;
+}
+
+.stat-row {
+  padding:14px 0;
+  border-bottom:1px solid rgba(0,0,0,.12);
+}
+
+.stat-row:last-of-type { border-bottom:none }
+
+.stat-val {
+  font-size:32px; font-weight:700;
+  letter-spacing:-.04em; color:#fff;
+  line-height:1;
+}
+
+.stat-lbl {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.12em; text-transform:uppercase;
+  color:rgba(0,0,0,.45);
+}
+
+/* Highlights */
+.hl-grid {
+  display:grid; grid-template-columns:1fr 1fr;
+  gap:2px; margin-bottom:2px;
+}
+
+.hl-card {
+  background:var(--panel); border:1px solid var(--border);
+  padding:26px 30px; transition:border-color .2s;
+}
+
+.hl-card:hover { border-color:var(--muted) }
+
+.hl-eye {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.18em; text-transform:uppercase;
+  color:var(--coral); margin-bottom:14px;
+  display:flex; align-items:center; gap:8px;
+}
+
+.hl-eye::before { content:''; display:block; width:14px; height:1px; background:var(--coral) }
+
+.hl-time {
+  font-family:var(--mono); font-size:26px;
+  font-weight:500; letter-spacing:-.01em;
+  color:var(--white); margin-bottom:8px;
+}
+
+.hl-desc { font-size:12px; color:var(--mid); line-height:1.6 }
+
+.hl-quote {
+  font-size:18px; font-weight:700;
+  letter-spacing:-.03em; line-height:1.4;
+  color:var(--white); margin-bottom:8px;
+}
+
+.hl-quote::before { content:'C'; color:var(--coral) }
+.hl-quote::after  { content:'D'; color:var(--coral) }
+
+/* Chapters */
+.chaps-grid {
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(190px,1fr));
+  gap:2px; margin-bottom:2px;
+}
+
+.chap-card {
+  background:var(--panel); border:1px solid var(--border);
+  padding:18px 22px; display:flex; flex-direction:column; gap:5px;
+}
+
+.chap-ts {
+  font-family:var(--mono); font-size:18px;
+  font-weight:500; color:var(--coral);
+}
+
+.chap-title { font-size:12px; color:var(--mid); line-height:1.4 }
+
+/* Problems */
+.prob-row {
+  display:flex; align-items:center; gap:18px;
+  padding:12px 22px;
+  background:var(--panel); border:1px solid var(--border);
+  border-bottom:none; transition:background .2s;
+}
+
+.prob-row:last-child { border-bottom:1px solid var(--border) }
+.prob-row:hover { background:#141414 }
+
+.prob-type {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.12em; text-transform:uppercase;
+  color:var(--yellow); min-width:120px;
+}
+
+.prob-desc { font-size:12px; color:var(--mid); flex:1; line-height:1.4 }
+.prob-at   { font-family:var(--mono); font-size:11px; font-weight:500; color:var(--yellow) }
+
+/* Cuts table */
+.cuts-bar {
+  display:flex; align-items:center;
+  justify-content:space-between;
+  padding:10px 0;
+  border-bottom:1px solid var(--border);
+  margin-bottom:2px;
+}
+
+.cuts-info { font-family:var(--mono); font-size:11px; color:var(--dim) }
+.cuts-info strong { color:var(--white) }
+.cuts-btns { display:flex; gap:8px }
+
+.btn-sm {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.1em; text-transform:uppercase;
+  color:var(--dim); background:none;
+  border:1px solid var(--muted);
+  padding:6px 12px; cursor:pointer; transition:all .2s;
+}
+
+.btn-sm:hover { border-color:var(--fog); color:var(--white) }
+
+.cut-row {
+  display:grid;
+  grid-template-columns:3px 110px 1fr 56px 72px 42px;
+  align-items:stretch;
+  background:var(--panel); border:1px solid var(--border);
+  border-bottom:none; transition:background .2s;
+}
+
+.cut-row:last-child { border-bottom:1px solid var(--border) }
+.cut-row:hover { background:#131313 }
+.cut-row.removed { opacity:.35 }
+
+.cut-bar { width:3px; flex-shrink:0 }
+.cut-bar.manter    { background:var(--green) }
+.cut-bar.cortar    { background:var(--coral) }
+.cut-bar.comprimir { background:var(--yellow) }
+.cut-bar.removed   { background:var(--border) }
+
+.cut-tc {
+  padding:16px 18px;
+  display:flex; flex-direction:column; justify-content:center; gap:3px;
+  border-right:1px solid var(--border);
+}
+
+.tc-r {
+  font-family:var(--mono); font-size:12px;
+  font-weight:500; color:var(--white);
+}
+
+.tc-d { font-family:var(--mono); font-size:10px; color:var(--dim) }
+
+.cut-body {
+  padding:16px 18px;
+  display:flex; flex-direction:column; justify-content:center; gap:5px;
+}
+
+.cut-tags { display:flex; gap:5px; align-items:center }
+
+.ctag {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.1em; text-transform:uppercase;
+  padding:2px 7px;
+}
+
+.ctag.manter    { background:rgba(62,207,142,.07);  color:var(--green);  border:1px solid rgba(62,207,142,.15) }
+.ctag.cortar    { background:rgba(253,125,89,.07);  color:var(--coral);  border:1px solid rgba(253,125,89,.15) }
+.ctag.comprimir { background:rgba(245,197,24,.07);  color:var(--yellow); border:1px solid rgba(245,197,24,.15) }
+.ctag.alta      { background:rgba(253,125,89,.05);  color:var(--coral);  border:1px solid rgba(253,125,89,.1) }
+.ctag.media     { background:rgba(255,255,255,.03); color:var(--dim);    border:1px solid var(--border) }
+.ctag.baixa     { background:transparent; color:#2A2A2A; border:1px solid #181818 }
+
+.cut-reason { font-size:12px; color:var(--dim); line-height:1.5 }
+
+.cut-prio {
+  padding:16px 10px;
+  display:flex; align-items:center; justify-content:center;
+  border-right:1px solid var(--border);
+  border-left:1px solid var(--border);
+}
+
+.pip { width:7px; height:7px; border-radius:50% }
+.p1 { background:var(--coral); box-shadow:0 0 6px rgba(253,125,89,.5) }
+.p2 { background:var(--yellow) }
+.p3 { background:var(--dim) }
+
+.cut-save {
+  padding:16px 12px;
+  display:flex; flex-direction:column;
+  align-items:center; justify-content:center;
+  border-right:1px solid var(--border);
+}
+
+.save-v { font-family:var(--mono); font-size:12px; color:var(--green) }
+.save-l { font-family:var(--mono); font-size:9px; color:var(--dim); letter-spacing:.06em }
+
+.cut-tog-cell {
+  display:flex; align-items:center;
+  justify-content:center; padding:0 6px;
+}
+
+.cut-toggle {
+  width:26px; height:26px;
+  border:1px solid var(--muted); background:none;
+  color:var(--dim); cursor:pointer;
+  font-size:12px; font-family:var(--mono);
+  display:flex; align-items:center; justify-content:center;
+  transition:all .15s;
+}
+
+.cut-toggle:hover { border-color:var(--white); color:var(--white) }
+.cut-toggle.on    { background:var(--green); border-color:var(--green); color:#000 }
+
+/* Transcript */
+.tx-wrap {
+  background:var(--panel); border:1px solid var(--border);
+}
+
+.tx-inner {
+  font-family:var(--mono); font-size:12px;
+  line-height:1.9; color:var(--mid);
+  padding:26px 30px; max-height:260px;
+  overflow-y:auto; white-space:pre-wrap;
+}
+
+.tx-inner::-webkit-scrollbar { width:3px }
+.tx-inner::-webkit-scrollbar-thumb { background:var(--muted) }
+
+/* Export */
+.export-panel {
+  background:var(--panel); border:1px solid var(--border);
+  padding:32px 36px; margin-top:2px;
+}
+
+.exp-opts { display:flex; gap:28px; margin-bottom:24px; flex-wrap:wrap }
+
+.opt-lbl {
+  display:flex; align-items:center; gap:9px;
+  cursor:pointer;
+  font-family:var(--mono); font-size:10px;
+  letter-spacing:.08em; text-transform:uppercase;
+  color:var(--mid); transition:color .2s;
+}
+
+.opt-lbl:hover { color:var(--white) }
+.opt-lbl input[type=checkbox] { accent-color:var(--coral); width:13px; height:13px }
+
+.btn-export {
+  width:100%; padding:18px;
+  background:var(--coral); color:#fff;
+  font-family:var(--sans); font-weight:700;
+  font-size:13px; letter-spacing:.04em;
+  border:none; cursor:pointer; transition:all .2s;
+  position:relative; overflow:hidden;
+}
+
+.btn-export::after {
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.1),transparent);
+  transform:translateX(-100%); transition:transform .4s;
+}
+
+.btn-export:hover { background:#e96a47 }
+.btn-export:hover::after { transform:translateX(100%) }
+.btn-export:disabled { opacity:.3; cursor:not-allowed }
+
+/* Downloads */
+#downloads-section { display:none; animation:fadeUp .5s both; padding:56px 0 }
+
+.dl-grid {
+  display:grid; grid-template-columns:repeat(3,1fr);
+  gap:2px;
+}
+
+.dl-card {
+  background:var(--panel); border:1px solid var(--border);
+  padding:32px 28px; transition:border-color .2s;
+}
+
+.dl-card:hover { border-color:var(--muted) }
+
+.dl-n {
+  font-size:64px; font-weight:700;
+  letter-spacing:-.06em; line-height:1;
+  color:var(--border); margin-bottom:18px;
+  transition:color .3s;
+}
+
+.dl-card:hover .dl-n { color:var(--muted) }
+.dl-ico { font-size:22px; margin-bottom:10px }
+.dl-title { font-size:18px; font-weight:700; letter-spacing:-.03em; color:var(--white); margin-bottom:4px }
+.dl-sub { font-family:var(--mono); font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim); margin-bottom:22px; flex:1 }
+
+.btn-dl {
+  display:block; text-align:center; padding:11px 18px;
+  background:var(--coral); color:#fff;
+  font-family:var(--mono); font-size:10px; font-weight:500;
+  letter-spacing:.12em; text-transform:uppercase;
+  text-decoration:none; border:none;
+  cursor:pointer; transition:background .2s;
+}
+
+.btn-dl:hover { background:#e96a47 }
+
+/* Jingle Modal */
+.modal-ov {
+  position:fixed; inset:0;
+  background:rgba(0,0,0,.9); z-index:500;
+  display:none; align-items:center; justify-content:center;
+  padding:24px; backdrop-filter:blur(8px);
+}
+
+.modal-ov.open { display:flex }
+
+.modal-box {
+  background:var(--ink); border:1px solid var(--muted);
+  max-width:480px; width:100%;
+  animation:fadeUp .3s both;
+}
+
+.modal-hd {
+  padding:26px 32px 22px;
+  border-bottom:1px solid var(--border);
+  display:flex; align-items:flex-start;
+  justify-content:space-between; gap:16px;
+}
+
+.modal-title {
+  font-size:20px; font-weight:700;
+  letter-spacing:-.03em; color:var(--white);
+}
+
+.modal-sub {
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.1em; text-transform:uppercase;
+  color:var(--dim); margin-top:5px;
+}
+
+.modal-close {
+  background:none; border:none; color:var(--dim);
+  font-size:18px; cursor:pointer; transition:color .2s;
+}
+
+.modal-close:hover { color:var(--white) }
+.modal-bd { padding:26px 32px 32px }
+
+.f-field { margin-bottom:16px }
+
+.f-label {
+  display:block;
+  font-family:var(--mono); font-size:9px;
+  letter-spacing:.18em; text-transform:uppercase;
+  color:var(--dim); margin-bottom:7px;
+}
+
+.f-row {
+  border:1px solid var(--muted); background:#0A0A0A;
+  padding:11px 14px;
+  display:flex; align-items:center; gap:10px;
+  cursor:pointer; transition:border-color .2s;
+}
+
+.f-row:hover { border-color:var(--fog) }
+
+.f-row input[type=file] { position:absolute; opacity:0; pointer-events:none }
+
+.f-name { font-family:var(--mono); font-size:11px; color:var(--mid); flex:1 }
+.f-browse { font-family:var(--mono); font-size:9px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim); border:1px solid var(--muted); padding:3px 9px; white-space:nowrap }
+
+.btn-save {
+  width:100%; padding:14px;
+  background:var(--coral); color:#fff;
+  font-family:var(--sans); font-weight:700;
+  font-size:13px; border:none; cursor:pointer;
+  margin-top:6px; transition:background .2s;
+}
+
+.btn-save:hover { background:#e96a47 }
+
+@media(max-width:768px) {
+  #app { padding:0 20px 60px }
+  .ep-grid { grid-template-columns:1fr }
+  .hl-grid { grid-template-columns:1fr }
+  .dl-grid { grid-template-columns:1fr }
+  .cut-row { grid-template-columns:3px 90px 1fr 42px }
+  .cut-prio,.cut-save { display:none }
+}
 </style>
 </head>
 <body>
 
-<nav>
-  <div class="nav-logo">podcast<span>editor</span></div>
-  <div class="nav-badge">Beta</div>
-  <div class="spacer"></div>
-  <button class="jingle-btn" onclick="document.getElementById('jingleModal').classList.add('open')">
-    ⚡ Configurar Vinheta
-  </button>
-</nav>
+<!-- ══ LOGIN SCREEN ══════════════════════════════════════════ -->
+<div id="login-screen">
+  <div class="login-bg"></div>
+  <div class="login-box">
+    <div class="login-logo">
+      <img src="data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+PCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiAiaHR0cDovL3d3dy53My5vcmcvR3JhcGhpY3MvU1ZHLzEuMS9EVEQvc3ZnMTEuZHRkIj48c3ZnIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIHZpZXdCb3g9IjAgMCAyNjQgMTQ0IiB2ZXJzaW9uPSIxLjEiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIHhtbDpzcGFjZT0icHJlc2VydmUiIHhtbG5zOnNlcmlmPSJodHRwOi8vd3d3LnNlcmlmLmNvbS8iIHN0eWxlPSJmaWxsLXJ1bGU6ZXZlbm9kZDtjbGlwLXJ1bGU6ZXZlbm9kZDtzdHJva2UtbGluZWpvaW46cm91bmQ7c3Ryb2tlLW1pdGVybGltaXQ6MjsiPjxwYXRoIGQ9Ik0yNDcuMTIyLDExMy41OTZjLTAuNjE5LDAuMDExIC0wLjkzMywtMC4wMTUgLTEuNTU2LDAuMTUyYy0xLjYxNCwwLjQzNCAtMi42NjUsMC44NzQgLTQuMDI4LDIuODE0Yy0xLjExLDEuNTggLTEuNjQyLDQuNjAzIC0xLjcwMiw1LjI3NGMtMC40MTQsNC42MyAtMC4wNjIsMTEuNDAyIC0wLjA1OSwxMS41MmMwLjA1NCwyLjQwOSAwLjE4NiwyLjM5NiAwLjMxMSwzLjc2M2MwLjM5MSw0LjI4IDAuNDA3LDQuMzA2IDAuMjA5LDQuNzI2Yy0wLjI3NCwwLjU4IC0xLjEwMSwwLjUxOSAtNC4xNDgsMC41MTljLTYuMzczLDAuMDAxIC02LjQzOSwwLjA0IC02LjgzOSwtMC4zMDVjLTAuODIzLC0wLjcwNyAtMC40ODMsLTEuNzIxIC0wLjM3NywtMi40NTZjMC4wNDQsLTAuMzAxIDAuNjc1LC0xMC4zNjIgMC43MjYsLTE1LjYzMmMwLjA3NCwtNy43NjQgLTAuMDM2LC05LjIwOCAtMC4wOTcsLTEwLjAwNmMtMC4yNDIsLTMuMTcyIC0wLjIyNywtMy4xNyAtMC4yNTUsLTMuNDQ1Yy0wLjAyNiwtMC4yNSAtMC4yODQsLTIuNzExIC0wLjM1NiwtMy4xMjNjLTAuMjQyLC0xLjM2OCAtMC4zMTUsLTEuODY2IDEuOTA0LC0yLjQwMWMxLjQwNywtMC4zMzkgMS4zOCwtMC40NDEgMi44MDcsLTAuNjU3YzAuNTMzLC0wLjA4MSAxLjA1NSwtMC4zNjIgMi44MTYsLTAuNTk0YzAuOTc0LC0wLjEyOCAzLjIzMSwtMS4wODcgMy4xODEsMS40NjVjLTAuMDQ1LDIuMjM4IC0wLjU0LDQuMTcgLTAuNTY2LDQuNDdjLTAuMDQ2LDAuNTM4IC0wLjEwOSwwLjUzMSAtMC4wOTYsMC41NzZjMC4wMjcsMC4wOTEgMC4xMTYsMC4xNiAwLjIwMSwwLjIwM2MwLjA1NCwwLjAyOCAwLjEzMSwwLjAyNSAwLjE4MiwtMC4wMDdjMC4xMDksLTAuMDY4IDAuNDU3LC0wLjgwOSAxLjEyMSwtMi4xMzVjMC4zMTMsLTAuNjI2IDEuNjcxLC0yLjIxNiAyLjY1MSwtMi45NmMwLjkzNSwtMC43MDkgMC45NTYsLTAuNjcyIDEuOTgsLTEuMjQyYzQuODA4LC0yLjY3OSA5LjY5NywtMC45NjkgOS44MjIsLTAuOTM2YzEuNTY5LDAuNDEzIDMuMTE1LDEuMzA3IDMuNDc3LDEuNjIzYzIuNTI1LDIuMjAzIDMuNTk1LDQuNjg2IDQuMzM5LDkuNzhjMC4zODUsMi42MzMgLTAuMDg2LDE2LjA0NiAwLjM4NywxOS42OTdjMC4xNjIsMS4yNSAwLjA5MiwxLjI0OSAwLjIxLDIuNTExYzAuMTksMi4wMzMgMC4xMjcsMi4wMzMgMC4zMDksNC4wNjZjMC4wMDksMC4xMDMgMC4wODEsMC45MDggLTAuMzE4LDEuMjUzYy0wLjMyNCwwLjI4IC0wLjM3NywwLjI1IC02LjU2OSwwLjI1Yy0zLjk2MywtMCAtNC40NjMsMC4wODQgLTQuNzU4LC0wLjUyOGMtMC40MTQsLTAuODU4IDAuMTczLC00LjIxMSAwLjIzOCwtNy4yMzVjMC4wNDQsLTIuMDU3IDAuMTI1LC0yLjA0OCAwLjIxMywtNC4zN2MwLjM3OSwtOS45OSAwLjQyOCwtOS4xNzIgLTAuMTQ0LC0xMS44Yy0wLjk1OSwtNC40MDcgLTMuNDM0LC00Ljc3MyAtNS4yMTQsLTQuODMzWiIgc3R5bGU9ImZpbGw6I2ZkN2Q1OTsiLz48cGF0aCBkPSJNNTAuMzY0LDEwNS40OTJjMC4yMzcsLTAuMjM2IDEuOTkzLC0xLjU2NSAyLjE1OCwtMS42NDljMC4xODksLTAuMDk2IDEuNDI4LC0wLjc4MSAxLjkyNCwtMC44NzdjMC42NywtMC4xMyAwLjk5NywtMC40NjkgNC43MDUsLTAuMzVjMS4yNjcsMC4wNDEgMy4xNjQsMC43MSA0LjAwNSwxLjE0YzAuMDQ1LDAuMDIzIDEuMjE1LDAuODk2IDEuMjQ3LDAuOTJjMC40NjcsMC4zNTIgMS45OTYsMi4yNyAyLjA0MywyLjM0NmMwLjA3NiwwLjEyMyAwLjgzNCwxLjQxIDEuMDM2LDEuNzIzYzAuMTU3LDAuMjQ0IDAuMTUzLDAuMzA3IDAuNDM5LDAuMjc4YzAuMjcxLC0wLjAyNyAwLjE4OCwtMC4xNDIgMC40MDUsLTAuNjI5YzAuMDg5LC0wLjE5OSAwLjYyNSwtMS4xODYgMS4yNDksLTEuODMxYzAuMDc0LC0wLjA3NiAxLjA0NiwtMC45OTggMS40NTMsLTEuMzk5YzAuMDUsLTAuMDQ5IDEuOTcyLC0xLjUyIDQuMDc1LC0yLjEyN2MwLjM3MiwtMC4xMDcgMS4zNzgsLTAuNTIgNC42ODcsLTAuNDI5YzAuOTU4LDAuMDI2IDIuNzc3LDAuNTMyIDMuMTQ0LDAuNjE1YzEuMDUsMC4yMzYgMy45ODcsMS44NiA1LjQ5OCw0LjIzYzAuNjczLDEuMDU2IDEuMTExLDIuOTE5IDEuMzQzLDMuNzAyYzAuMTI5LDAuNDM2IDAuMzg4LDEuNjIzIDAuNjIyLDMuNzUyYzAuMTExLDEuMDA4IC0wLjAyMiwxNC42NDkgMC4yMzUsMTUuOTY5YzAuMzgzLDEuOTcyIDAuNDMxLDYuODU4IDAuNTI1LDguMDk4YzAuMDYxLDAuNzk5IDAuMjI0LDAuNzcyIDAuMjU2LDEuNTY5YzAuMDY1LDEuNTk1IC0wLjM1LDEuNTQ3IC0wLjM3NCwxLjU1OWMtMC40NTEsMC4yMzQgLTAuNDI2LDAuMyAtMC45MjcsMC4zNjdjLTAuNjcsMC4wOSAtMC42NzEsMC4wMzIgLTguNDQ5LDAuMDEyYy0wLjM0NCwtMC4wMDEgLTIuMjQ5LDAuMjgyIC0yLjI3NCwtMS42MjNjLTAuMDMzLC0yLjQ1MyAwLjEyNSwtMy4xNDggMC4xODUsLTMuNDE1YzAuMTQ5LC0wLjY1OCAwLjM3NCwtNS44IDAuMzkzLC02LjU5OGMwLjEwOSwtNC41MzcgMC4wMDcsLTQuNTMxIDAuMDk2LC05LjA2NWMwLjAxNywtMC44NzkgMC4xODQsLTMuNDk3IC0wLjE3MywtNC44MzJjLTAuMTE2LC0wLjQzMyAtMC4xNjQsLTEuMDg4IC0wLjg0NCwtMi40MDljLTAuMDk1LC0wLjE4NSAtMC45NzMsLTEuMjI2IC0xLjc3MSwtMS42MDZjLTEuOTMyLC0wLjkyMSAtMy4zNTYsLTAuNDU3IC0zLjc0OCwtMC4zNDRjLTEuMDY3LDAuMzA3IC0xLjEwOSwwLjQxMiAtMS4zMDcsMC41MzljLTAuMzYyLDAuMjM0IC0xLjY3MiwxLjM3IC0yLjM0MSwzLjI0NmMtMC40NzYsMS4zMzQgLTAuNzc5LDIuMDg2IC0wLjgyNSwzLjgxNmMtMC4wMDUsMC4xODMgLTAuMDgzLDAuMTc3IC0wLjA5NSwzLjc3OWMtMC4wMTQsNC40ODUgMC40NjgsMTIuODQ1IDAuNzIsMTQuMDk4YzAuMTA5LDAuNTQyIDAuMTU3LDAuNTM1IDAuMjA5LDIuNDcyYzAuMDM0LDEuMjY1IC0wLjI0MSwxLjY3MSAtMC43NSwxLjg0OGMtMC4yNjQsMC4wOTIgLTEuODEyLDAuMTA2IC00LjA1MSwwLjEwOWMtNi4wODcsMC4wMDcgLTYuMTI2LDAuMDE1IC02LjU5OSwtMC4zNTNjLTAuOTIyLC0wLjcxOSAtMC41MzIsLTIuMzQ3IC0wLjQ5LC0yLjUwNmMwLjIwMSwtMC43NTggMC4wNjksLTEuNTEgMC4yMjgsLTIuMjE2YzAuNDU3LC0yLjAyOCAwLjU1NCwtMTUuMDA5IDAuNTI0LC0xNi44OTFjLTAuMDM2LC0yLjIzMyAtMC4wNzMsLTAuNzY4IC0wLjIxMywtMS42OGMtMC4xNDcsLTAuOTUzIC0wLjAxNSwtMC44MSAtMC4yMjksLTEuNTljLTAuMzMzLC0xLjIxNSAtMC45NTUsLTIuNzMyIC0xLjI1OCwtMy4xNTVjLTAuOTk2LC0xLjM5MyAtMS43NzksLTEuODc2IC00LjE1NSwtMS43MzdjLTAuMTU1LDAuMDA5IC0wLjYzLDAuMDM3IC0xLjgyLDAuNjU4Yy0wLjI0NiwwLjEyOSAtMS41MjIsMS4wNzkgLTIuMTQxLDIuMjA5Yy0wLjE1MywwLjI4IC0wLjIsMC4yOSAtMC4zNDgsMC44MjhjLTAuMDE1LDAuMDU0IC0wLjIzOCwwLjYxNiAtMC40OSwxLjUwOGMtMC4yMjEsMC43ODEgLTAuNzE3LDQuNjA4IC0wLjY3NSw4LjU4OWMwLjAwOCwwLjc5MiAwLjM3LDkuMTczIDAuNDExLDkuOTYyYzAuMDksMS43MjQgMC4zODEsMi42ODMgMC40MzcsMy40NzhjMC4xNjIsMi4yNjggLTAuMTE1LDIuMzcgLTAuMzgsMi41MTFjLTAuNzU5LDAuNDA0IC0wLjc5NCwwLjM5NSAtNC4zODIsMC4zOWMtNi4xMzUsLTAuMDA4IC02LjE4OSwwLjAzMSAtNi42MjQsLTAuMzE3Yy0wLjE1NiwtMC4xMjUgLTAuNDU3LC0wLjE3NCAtMC4zODksLTEuNjQ1YzAuMDcyLC0xLjU2NCAwLjIyNCwtMi4yNjMgMC41MjksLTMuNTI1YzAuMjY1LC0xLjA5MiAwLjExMywtNS45NTggMC4xMjQsLTExLjE3YzAuMDIsLTkuMTUzIDAuMDM4LC0xMy45NzIgLTAuMTA5LC0xNC43MjNjLTAuMTc5LC0wLjkxMyAtMC40NjksLTIuOTI2IC0wLjUwNSwtNC4wMzdjLTAuMDM1LC0xLjA4MSAwLjA4NCwtMS4zOTIgMC40MTYsLTEuNTU1YzAuMTkzLC0wLjA5NCAwLjE3NiwtMC4xMTMgMC4zNiwtMC4yMTRjMC40MTcsLTAuMjI4IDMuNzgxLC0xLjA4MiA0LjMxMiwtMS4xMzljMC43OTksLTAuMDg1IDIuMzM0LC0wLjU0NSAzLjEzLC0wLjYxNWMyLjM0NCwtMC4yMDYgMi41MzEsMC4zNzEgMi41MzEsMC4zNzFjMCwwIDAuMjUxLDAuMzE1IDAuMjY3LDAuMzQ2YzAuMTUzLDAuMjgzIDAuMTI2LDEuMzAxIDAuMTA0LDIuMThjLTAuMDI0LDAuOTg1IC0wLjU2MywxLjg5NiAtMC43NTMsMy4wMjNjLTAuMDgzLDAuNDk0IC0wLjE0OSwwLjc0MiAwLjM0MiwwLjY1N2MwLjE4MiwtMC4wMzIgMC4yODgsLTAuMzEzIDAuMzAxLC0wLjM0N2MwLjEyNCwtMC4zMyAwLjEzNSwtMC4zMjEgMC4yOTMsLTAuNjRjMC4wNSwtMC4xMDEgMC41ODUsLTEuNDQ4IDEuMDA2LC0yLjA1OGMwLjQxOCwtMC42MDYgMS4yOCwtMS4zNjYgMS41MTgsLTEuNjA0WiIgc3R5bGU9ImZpbGw6I2ZkN2Q1OTsiLz48cGF0aCBkPSJNMjE2Ljg3MSwxMDUuMzczYzAuMDU5LDAuMDQ4IDMuODUxLDIuMjEgNi44MjEsOC44OTNjMC40MDQsMC45MDkgMC4yMzIsMC45NiAwLjU1NiwxLjg5M2MwLjA2MywwLjE4MiAwLjEwMywwLjU2IDAuMTA4LDAuNjFjMC4wOTksMC45NTMgMC41NTQsMi41NCAwLjU5LDQuMDczYzAuMDA1LDAuMjAxIDAuMDc2LDQuMzMyIC0wLjA3NSw1LjAwMWMtMC4yNzcsMS4yMjggLTAuMDUzLDEuMjY2IC0wLjM5NywyLjQ3M2MtMC4yMiwwLjc3MSAtMC4wOSwwLjc5MyAtMC4zMTUsMS41NjJjLTAuMTgyLDAuNjI0IC0wLjEsMC42MzkgLTAuMzE1LDEuMjQ1Yy0wLjE4NiwwLjUyNSAtMC4xNDksMC41MzYgLTAuNDAyLDEuMDNjLTAuMTUxLDAuMjk0IC0wLjQxNSwxLjA5NiAtMC40NDcsMS4xOTJjLTAuMDI5LDAuMDg5IC0wLjA0OSwwLjE4MiAtMC4wOTUsMC4yNjNjLTAuMDI1LDAuMDQ0IC0wLjA4NywwLjA1OCAtMC4xMTMsMC4xMDFjLTAuMDQ4LDAuMDc5IC0wLjA1MSwwLjE4MiAtMC4xMDQsMC4yNThjLTAuMDM1LDAuMDUgLTAuMTExLDAuMDU5IC0wLjE0OCwwLjEwN2MtMC4xNjMsMC4yMTIgLTIuMzIsNy4xNjkgLTEyLjAyMyw5LjA3NmMtMC42MzQsMC4xMjUgLTAuNjM5LDAuMDQ1IC0xLjI2MiwwLjE5NGMtMC4yMzksMC4wNTcgLTMuNDYyLDAuMjE2IC00LjY1NiwtMC4wODhjLTAuOTIzLC0wLjIzNSAtMC45NjIsLTAuMDE0IC0xLjg2OCwtMC4zMTdjLTAuNzksLTAuMjY0IC0xLjY4MiwtMC41MzEgLTEuODY0LC0wLjYyNWMtMC40OTksLTAuMjU5IC0wLjQ5MiwtMC4yNjkgLTEuMjk1LC0wLjUzNWMtMC4zMzksLTAuMTEzIC0wLjMwNCwtMC4xNzQgLTAuNjI5LC0wLjMwMmMtMC4wODYsLTAuMDM0IC0wLjE3OCwtMC4wNTggLTAuMjU4LC0wLjEwNWMtMC4wNDQsLTAuMDI2IC0wLjA2MiwtMC4wODMgLTAuMTA2LC0wLjEwOWMtMC4wNzksLTAuMDQ3IC0wLjE3OSwtMC4wNTUgLTAuMjU1LC0wLjEwN2MtMC4wNSwtMC4wMzQgLTAuMDYzLC0wLjEwNiAtMC4xMTEsLTAuMTQyYy0wLjI0NywtMC4xODYgLTAuNzYzLC0wLjQ0MiAtMC44MzEsLTAuNDc2Yy0wLjI3NywtMC4xMzggLTAuNjE5LC0wLjQ2OSAtMC42OTUsLTAuNTE4Yy0wLjA3NCwtMC4wNDggLTAuMTY5LC0wLjA2IC0wLjIzOSwtMC4xMTRjLTAuMDUzLC0wLjA0MSAtMC4wNjcsLTAuMTE4IC0wLjExOCwtMC4xNjFjLTAuMDY0LC0wLjA1MyAtMC4xNTgsLTAuMDY0IC0wLjIyLC0wLjExOWMtMC4wNTMsLTAuMDQ3IC0wLjA2NSwtMC4xMjkgLTAuMTE3LC0wLjE3N2MtMC4xNzIsLTAuMTYyIC0wLjI2MSwtMC4xNzEgLTAuMzg5LC0wLjI2MWMtNy4zNSwtNS4yMjYgLTYuMzk3LC0xNy41MzUgLTYuMzM1LC0xOC4zMzZjMC4xOTEsLTIuNDU4IDAuNjgxLC00LjE1NCAwLjg1MiwtNS4wMjJjMC4xMDUsLTAuNTM0IDAuMTU0LC0wLjUxMyAwLjcwNCwtMi4xN2MwLjAzLC0wLjA4OSAwLjA1MywtMC4xODIgMC4wOTgsLTAuMjY1YzAuMDIyLC0wLjA0MSAwLjA3NiwtMC4wNiAwLjA5OCwtMC4xMDFjMC4xMzYsLTAuMjQ5IDAuMDcsLTAuMjcxIDAuMjExLC0wLjUyNWMwLjAyMywtMC4wNDIgMC4wNzMsLTAuMDY1IDAuMDk1LC0wLjEwOGMwLjA4NCwtMC4xNjcgMC4xMzMsLTAuMzQ5IDAuMjE4LC0wLjUxNWMwLjAyMywtMC4wNDUgMC4wOCwtMC4wNjUgMC4xMDMsLTAuMTA5YzAuMDg0LC0wLjE2NiAwLjEyNiwtMC4zNSAwLjIxMiwtMC41MTVjMC4wMjQsLTAuMDQ1IDAuMDg2LC0wLjA2MSAwLjExMiwtMC4xMDVjMC4wNDgsLTAuMDc5IDAuMDU0LC0wLjE4IDAuMTA1LC0wLjI1NmMwLjAzMywtMC4wNDkgMC4xMDUsLTAuMDYxIDAuMTQsLTAuMTA4YzAuMDI0LC0wLjAzMyAwLjEzLC0wLjQ1MiAwLjg3MywtMS40MDdjMi42MTcsLTMuMzY0IDYuNDksLTUuNDQ0IDcuMSwtNS42ODljMC40NjMsLTAuMTg2IDAuNDM2LC0wLjI0OSAwLjkyMSwtMC4zNzNjMC40ODgsLTAuMTI0IDAuNDU2LC0wLjIxNCAwLjk0NSwtMC4zMDZjMC4xOTcsLTAuMDM3IDAuNCwtMC4wNDQgMC41OTQsLTAuMDkzYzAuMTI2LC0wLjAzMiAwLjIzNywtMC4xMDggMC4zNiwtMC4xNDhjMC4wNDcsLTAuMDE2IDAuMjE4LC0wLjA3MiAwLjYxMSwtMC4xMDZjMC42NDQsLTAuMDU2IDAuNjQsLTAuMDU3IDEuMjY1LC0wLjIwNGMwLjcxNiwtMC4xNjkgMy44OTgsLTAuMTk1IDQuNjgxLC0wLjAwNGMwLjc3OCwwLjE5IDAuNzg5LDAuMDk4IDEuNTc4LDAuMjQxYzAuMTAyLDAuMDE4IDAuMDg2LDAuMDc3IDEuMjUzLDAuMzA3YzAuOTA4LDAuMTc5IDIuMDY0LDAuNzkxIDIuMjM0LDAuODgxYzAuMjQ5LDAuMTMyIDAuMjY2LDAuMDgzIDAuNTE0LDAuMjI1YzAuODEsMC40NjEgMS40OTgsMC43NjggMS42MDksMC44NDdjMC4wNTIsMC4wMzggMC4wNywwLjExMSAwLjEyLDAuMTUyWm0tMi4xNzksMTkuNzIyYy0wLjEwMywtMy44MjEgMC4xNDIsLTEzLjk5MSAtNy45MzMsLTEzLjk1M2MtNS41MjQsMC4wMjYgLTcuNjU0LDYuMjcyIC03LjU0MywxNC4wOThjMC4wNDMsMy4wNDQgMS4yNDIsMTAuMDQxIDguMTU4LDkuODk0YzQuOTM1LC0wLjEwNSA3LjQyLC02LjIxNyA3LjMxOCwtMTAuMDM4WiIgc3R5bGU9ImZpbGw6I2ZkN2Q1OTsiLz48cGF0aCBkPSJNMTg0LjAzNCwxMTAuODZjMC4wMDcsMC4zIC0wLjA4MywwLjQwMyAtMC4zNTgsMC44MjZjLTAuMzksMC42MDIgLTEuNzc0LDAuNTE5IC0zLjUzNiwtMC4xNzdjLTUuMzA1LC0yLjA5NCAtMTAuODI2LC0xLjMxNyAtMTAuNzE2LDIuMTQ2YzAuMTI4LDQuMDAzIDMuNjEyLDMuNzIzIDUuNzQ3LDQuNTg3YzIuNTM3LDEuMDI3IDguNTE0LDMuNTI3IDEwLjcxNiw5Ljc2NWMwLjg1MSwyLjQxMiAwLjYxMiw0LjM0NyAwLjU2NSw0LjcyNWMtMC4xMTEsMC44OTQgLTAuNjA1LDYuODQgLTcuNTk3LDkuNTQ0Yy0xLjAzMiwwLjM5OSAtMi44NDQsMC43MjEgLTMuMzY0LDAuODI0Yy0wLjU3NCwwLjExNCAtNC45ODIsMC40ODggLTguMTY0LC0wLjI2MmMtMC45MiwtMC4yMTcgLTEuMzQ4LC0wLjE2NiAtMi41MDEsLTAuNjc2Yy0xLjEzNSwtMC41MDIgLTIuODY5LC0xLjYzNCAtMy45ODgsLTIuMzk3Yy0wLjY4NywtMC40NTcgLTEuMTIzLC0xLjIwOCAtMS4xOCwtMi4wMzFjLTAuMDcyLC0xLjA1IC0wLjE1MiwtMi42MTkgLTAuMTQ4LC00LjJjMC4wMDEsLTAuNTI0IDAuMDk5LC0xLjcwNyAxLjA4MSwtMS43NDNjMC44MDksLTAuMDMgMS4xMDYsLTAuMTY1IDIuNDA1LDAuNzY3YzAuMDk3LDAuMDcgMS4xNjcsMC44MjggMy4zNTcsMS44NDljNS4wMTMsMi4zMzcgOC44NjQsMi4wMyAxMC4xNjYsLTAuMjI5YzAuMjI1LC0wLjM5IDAuMzU0LC0wLjY2MyAwLjM3OSwtMS41OTJjMC4wODgsLTMuMjI0IC0zLjA0NywtNC4zODIgLTQuNTc2LC01LjEwOWMtMS4yNjYsLTAuNjAyIC0xLjIzOSwtMC42NDYgLTIuNTE2LC0xLjIyN2MtMC4yMjQsLTAuMTAyIC00LjAxNSwtMS45NSAtNS4yMzcsLTIuOTUxYy0xLjA0LC0wLjg1MSAtMS40NTcsLTEuMTg3IC0yLjYxNiwtMi43MWMtMS41MTYsLTEuOTkyIC0yLjMxNiwtNS4zODIgLTEuODc5LC03Ljg4N2MwLjA3NiwtMC40MzYgMC4yNjIsLTMuODE1IDMuNzI5LC02Ljk5M2MxLjE1NiwtMS4wNiAxLjI1OCwtMC45MTIgMi42NDQsLTEuNjY5YzAuODksLTAuNDg3IDQuNjUxLC0xLjU5NyA3Ljg0MSwtMS4yNTdjMy4wMzcsMC4zMjMgNS40NzksMS4wMTggNy4wODYsMS41OTFjMS4zMjYsMC40ODMgMi4yNTEsMS42OTIgMi4zNywzLjA5OGMwLjEzMywxLjMxMSAwLjI3NCwyLjgyNSAwLjI4OCwzLjM4N1oiIHN0eWxlPSJmaWxsOiNmZDdkNTk7Ii8+PHBhdGggZD0iTTE0NC43MDksMTQwLjg2NmMtMC4wMDIsMC4xMDEgMC4wMTIsMC4yMDIgMC4wMSwwLjMwM2MtMC4wMzMsMS40NDUgLTIuMTk1LDEuMTkgLTIuNjk5LDEuMTkxYy0wLjg3NywwLjAwMiAtNy42MjksMC4wMDUgLTcuODE0LC0wLjAwOWMtMS4yNCwtMC4wOTYgLTEuMjEsLTEuMzM4IC0xLjIwNiwtMS40OTFjMC4wNDIsLTEuNzI5IDAuMjg4LC0xLjcwNSAwLjM2NiwtMy40MzNjMC4yMjIsLTQuODc3IDAuNTE4LC04LjcyMiAwLjU0NiwtMTAuNjQxYzAuMTU0LC0xMC44ODkgMC4wNzIsLTEwLjg4OSAtMC40NDYsLTE2LjU2M2MtMC4xMDEsLTEuMTAyIDAuMDMyLC0xLjIzNiAtMC4zMjIsLTIuODAzYy0wLjQ1NSwtMi4wMTggMC40NjYsLTEuOTg2IDMuODc1LC0yLjgyNWMwLjkyMywtMC4yMjcgMC45MzYsLTAuMTUxIDEuNTU5LC0wLjMyOGMwLjM1NywtMC4xMDIgMy43NDgsLTEuMDY4IDQuNjM2LC0wLjI1MWMxLjAzMywwLjk1MSAwLjY1OCwxLjg2NiAwLjU5Nyw1LjI1N2MtMC4wMzMsMS44MjcgLTAuMjA2LDIuNTkyIC0wLjI1NiwyLjgxMmMtMC4wMTEsMC4wNDkgLTAuMTM0LDAuNTkxIC0wLjEzLDAuNjEzYzAuMDA3LDAuMDQ1IDAuMDgzLDAuNTI5IDAuNDcxLDAuMzI3YzAuMTU4LC0wLjA4MiAwLjcxNCwtMi41NTUgMi43MjgsLTUuMzczYzAuNzcsLTEuMDc4IDAuNzQ3LC0xLjI2NyAyLjQ3NSwtMi44N2MwLjE0MywtMC4xMzMgMC44NDQsLTAuNzgzIDIuMDU4LC0xLjMxNGMxLjUxNSwtMC42NjMgMi41MjIsLTAuNjgxIDIuNzQ5LC0wLjY4NmMxLjI5LC0wLjAyMyA0LjE4NywwLjQwMyA0LjE2OCwyLjQyNmMtMC4wMDMsMC4zNDYgLTAuMTQxLDEuMTQ1IC0wLjE3OCwxLjU1NGMtMC4xMzUsMS41MzEgLTAuNTY5LDMuMzk1IC0wLjYxMiwzLjc1Yy0wLjI2NSwyLjE4MyAtMC40MDIsMi44OTUgLTIuMDgxLDIuNDI4Yy0xLjI2OSwtMC4zNTIgLTYuMTA3LDAuNjEyIC04LjcxMiw1LjQ1M2MtMS43MzMsMy4yMjIgLTIuMjksNi44OSAtMi40NjEsOC4yODVjLTAuNDM1LDMuNTUxIC0wLjE2NCw5LjIzNiAwLjY3OSwxNC4xODRaIiBzdHlsZT0iZmlsbDojZmQ3ZDU5OyIvPjxwYXRoIGQ9Ik0xMy4zODQsMTMxLjg5N2MwLjMyNCwwLjMyMSAwLjMwNCwwLjMzOCAwLjY2OSwwLjYxNGMwLjYwNiwwLjQ1OCAxLjIyMywwLjg3OSAyLjIxLDEuMjU3YzEuMzk1LDAuNTM0IDEuOTE0LDAuNDY4IDIuMjI1LDAuNTQzYzAuODI5LDAuMiAwLjgzMywwLjE4NiAyLjgxOSwwLjE3MmMwLjc5NCwtMC4wMDYgMi42MjIsLTAuMjk3IDIuNzc0LC0wLjM0M2MwLjAwMywtMC4wMDEgMS4wMDUsLTAuMzI0IDEuNTg1LC0wLjU0OWMwLjgsLTAuMzExIDIuNDYyLC0xLjA5MSAyLjg5NCwtMS4zOTRjMC41MjcsLTAuMzcgMC41MjcsLTAuMzY2IDAuNTczLC0wLjM5N2MwLjk5MiwtMC42NjcgMS44LC0wLjk1NCAyLjE3MywtMC45MDZjMC4yNTMsMC4wMzIgMC42MjEsMC4xODQgMC43NjIsMC40NDFjMC4yMjYsMC40MTEgMC42NjcsMS4wNDMgMC41OTIsMi4wMjZjLTAuMDIzLDAuMjk5IC0wLjA0NiwwLjU3MiAtMC4yMDcsMC44NzZjLTAuMDIyLDAuMDQxIC0xLjM2NiwyLjU4MyAtMi4xODMsMy4zODhjLTAuMjExLDAuMjA3IC0xLjg4NSwxLjg1NSAtMi4wNSwyLjAxNmMtMC43NDUsMC43MyAtMS42MDUsMS4zMzUgLTEuNjk0LDEuNDAzYy0wLjAzMywwLjAyNSAtMC45MDUsMC40NzMgLTEuMjA3LDAuNjVjLTAuMDk2LDAuMDU2IC0wLjEwNCwwLjAzNyAtMS4yNDgsMC42MTljLTAuMTY3LDAuMDg1IC0xLjE2MiwwLjQwMyAtMS44MDUsMC41MzdjLTAuMzgyLDAuMDggLTIuMDMsMC41NCAtMi44MzMsMC41NjFjLTMuNjI5LDAuMDk1IC01LjE1LC0wLjIyNiAtNS45NDksLTAuMjgyYy0wLjkzOCwtMC4wNjYgLTMuODgyLC0xLjA2NyAtNC4wMDMsLTEuMTM0Yy0wLjA0MywtMC4wMjQgLTMuMjExLC0yLjAxNiAtMy4zOTMsLTIuMTg1Yy0wLjAyOCwtMC4wMjYgLTEuNDMsLTEuMjg5IC0yLjAxMiwtMi4wNDhjLTAuNjU5LC0wLjg1OSAtMS44NjgsLTIuOTM3IC0xLjk0MSwtMy4xMDljLTEuNjI2LC0zLjgxNyAtMS44NDgsLTUuMTY5IC0yLjA3MSwtNy44NzNjLTAuMjI3LC0yLjc2NSAwLjE4NywtNi4yMTggMC43MDcsLTguNzE3YzAuNDU3LC0yLjE5NiAyLjM3NCwtNi4xOTcgMi40MTMsLTYuMjhjMC4xMiwtMC4yNTQgMy45NDUsLTkuNDQzIDE1LjMwNSwtOS4zNjdjMS41OTgsMC4wMTEgMTIuMzg3LDAuMjE1IDE0LjA1OCwxMy4xMThjMC4yNjYsMi4wNTMgMC4zNTUsNC44NSAtMC4wODcsNi4yMWMtMC4wNTEsMC4xNTcgLTAuNDg4LDEuNSAtMC44NzcsMS44NjZjLTAuMDYxLDAuMDU3IC0wLjE1MSwwLjA3NSAtMC4yMTgsMC4xMjZjLTAuMjU1LDAuMTkzIC0wLjI0OCwwLjI4NSAtMS4yOTksMC4yODljLTYuMjU5LDAuMDI0IC0xMC45MTYsMC4wMiAtMTQuMDksMC4wMmMtMy40MywtMCAtNS4xMjcsMC4wMDUgLTUuMjM5LDAuMDU2Yy0wLjA1MiwwLjAyNCAtMC4wNzQsMC4wODcgLTAuMTE1LDAuMTI3Yy0wLjExMSwwLjEwOSAtMC4yNCwwLjA5NyAtMC4xNjIsMS4yOThjMC4wNTEsMC43OTYgMC45NTksMy4zNjMgMS4wNDIsMy41MDVjMC4xNDYsMC4yNDkgMC44ODUsMS42OTIgMS4yNjYsMi4xOTZjMC4yNzYsMC4zNjQgMC4yOTIsMC4zNDMgMC42MTYsMC42NjlabTQuNTIxLC0xMy42OTdjMC44MzksLTAuMDA1IDEuNzMzLC0wLjAxIDMuNDA1LC0wLjAxNmMxLjU4OSwtMC4wMDUgMi4yMTcsLTAuMjIzIDIuMDYyLC0yLjk2MmMtMC4xNzIsLTMuMDE5IC0xLjkzNCwtNS41NjMgLTQuNTgzLC02LjA1NGMtMC4zMSwtMC4wNTcgLTMuNTYzLC0wLjYwMSAtNi4yMTIsMy4wNDJjLTAuNDc0LDAuNjUxIC0xLjkxMywyLjMyOCAtMi4xMTYsNS4xOWMtMC4wMDQsMC4wNTEgMC4wMiwwLjM2MSAwLjI1NCwwLjU4NWMwLjI4OSwwLjI3NiAwLjk3NywwLjIyNyAzLjQwMSwwLjIyNWMxLjkyOCwtMC4wMDEgMi44MjIsLTAuMDA1IDMuNzg5LC0wLjAxMVoiIHN0eWxlPSJmaWxsOiNmZDdkNTk7Ii8+PHBhdGggZD0iTTEwOC41MzUsMTMxLjg5N2MwLjMyNCwwLjMyMSAwLjMwNCwwLjMzOCAwLjY2OSwwLjYxNGMwLjYwNiwwLjQ1OCAxLjIyMywwLjg3OSAyLjIxLDEuMjU3YzEuMzk1LDAuNTM0IDEuOTE0LDAuNDY4IDIuMjI1LDAuNTQzYzAuODI5LDAuMiAwLjgzMywwLjE4NiAyLjgxOSwwLjE3MmMwLjc5NCwtMC4wMDYgMi42MjIsLTAuMjk3IDIuNzc0LC0wLjM0M2MwLjAwMywtMC4wMDEgMS4wMDUsLTAuMzI0IDEuNTg1LC0wLjU0OWMwLjgsLTAuMzExIDIuNDYyLC0xLjA5MSAyLjg5NCwtMS4zOTRjMC41MjcsLTAuMzcgMC41MjcsLTAuMzY2IDAuNTczLC0wLjM5N2MwLjk5MiwtMC42NjcgMS44LC0wLjk1NCAyLjE3MywtMC45MDZjMC4yNTMsMC4wMzIgMC42MjEsMC4xODQgMC43NjIsMC40NDFjMC4yMjYsMC40MTEgMC42NjcsMS4wNDMgMC41OTIsMi4wMjZjLTAuMDIzLDAuMjk5IC0wLjA0NiwwLjU3MiAtMC4yMDcsMC44NzZjLTAuMDIyLDAuMDQxIC0xLjM2NiwyLjU4MyAtMi4xODMsMy4zODhjLTAuMjExLDAuMjA3IC0xLjg4NSwxLjg1NSAtMi4wNSwyLjAxNmMtMC43NDUsMC43MyAtMS42MDUsMS4zMzUgLTEuNjk0LDEuNDAzYy0wLjAzMywwLjAyNSAtMC45MDUsMC40NzMgLTEuMjA3LDAuNjVjLTAuMDk2LDAuMDU2IC0wLjEwNCwwLjAzNyAtMS4yNDgsMC42MTljLTAuMTY3LDAuMDg1IC0xLjE2MiwwLjQwMyAtMS44MDUsMC41MzdjLTAuMzgyLDAuMDggLTIuMDMsMC41NCAtMi44MzMsMC41NjFjLTMuNjI5LDAuMDk1IC01LjE1LC0wLjIyNiAtNS45NDksLTAuMjgyYy0wLjkzOCwtMC4wNjYgLTMuODgyLC0xLjA2NyAtNC4wMDMsLTEuMTM0Yy0wLjA0MywtMC4wMjQgLTMuMjExLC0yLjAxNiAtMy4zOTMsLTIuMTg1Yy0wLjAyOCwtMC4wMjYgLTEuNDMsLTEuMjg5IC0yLjAxMiwtMi4wNDhjLTAuNjU5LC0wLjg1OSAtMS44NjgsLTIuOTM3IC0xLjk0MSwtMy4xMDljLTEuNjI2LC0zLjgxNyAtMS44NDgsLTUuMTY5IC0yLjA3MSwtNy44NzNjLTAuMjI3LC0yLjc2NSAwLjE4NywtNi4yMTggMC43MDcsLTguNzE3YzAuNDU3LC0yLjE5NiAyLjM3NCwtNi4xOTcgMi40MTMsLTYuMjhjMC4xMiwtMC4yNTQgMy45NDUsLTkuNDQzIDE1LjMwNSwtOS4zNjdjMS41OTgsMC4wMTEgMTIuMzg3LDAuMjE1IDE0LjA1OCwxMy4xMThjMC4yNjYsMi4wNTMgMC4zNTUsNC44NSAtMC4wODcsNi4yMWMtMC4wNTEsMC4xNTcgLTAuNDg4LDEuNSAtMC44NzcsMS44NjZjLTAuMDYxLDAuMDU3IC0wLjE1MSwwLjA3NSAtMC4yMTgsMC4xMjZjLTAuMjU1LDAuMTkzIC0wLjI0OCwwLjI4NSAtMS4yOTksMC4yODljLTYuMjU5LDAuMDI0IC0xMC45MTYsMC4wMiAtMTQuMDksMC4wMmMtMy40MywtMCAtNS4xMjcsMC4wMDUgLTUuMjM5LDAuMDU2Yy0wLjA1MiwwLjAyNCAtMC4wNzQsMC4wODcgLTAuMTE1LDAuMTI3Yy0wLjExMSwwLjEwOSAtMC4yNCwwLjA5NyAtMC4xNjIsMS4yOThjMC4wNTEsMC43OTYgMC45NTksMy4zNjMgMS4wNDIsMy41MDVjMC4xNDYsMC4yNDkgMC44ODUsMS42OTIgMS4yNjYsMi4xOTZjMC4yNzYsMC4zNjQgMC4yOTIsMC4zNDMgMC42MTYsMC42NjlabTQuNTIxLC0xMy42OTdjMC44MzksLTAuMDA1IDEuNzMzLC0wLjAxIDMuNDA1LC0wLjAxNmMxLjU4OSwtMC4wMDUgMi4yMTcsLTAuMjIzIDIuMDYyLC0yLjk2MmMtMC4xNzIsLTMuMDE5IC0xLjkzNCwtNS41NjMgLTQuNTgzLC02LjA1NGMtMC4zMSwtMC4wNTcgLTMuNTYzLC0wLjYwMSAtNi4yMTIsMy4wNDJjLTAuNDc0LDAuNjUxIC0xLjkxMywyLjMyOCAtMi4xMTYsNS4xOWMtMC4wMDQsMC4wNTEgMC4wMiwwLjM2MSAwLjI1NCwwLjU4NWMwLjI4OSwwLjI3NiAwLjk3NywwLjIyNyAzLjQwMSwwLjIyNWMxLjkyOCwtMC4wMDEgMi44MjIsLTAuMDA1IDMuNzg5LC0wLjAxMVoiIHN0eWxlPSJmaWxsOiNmZDdkNTk7Ii8+PHBhdGggZD0iTTE2MS40NzQsNDkuMDU1Yy0wLjU0OSwtMC43MzMgLTEsLTEuNDU4IC0xLjQ2OSwtMS43M2MtMC4yNywtMC4xNTcgLTIuMDcyLC0yLjUwNSAtMi4yMzUsLTMuMzk1Yy0xLjEzNSwtNi4yMTUgNy4zNjIsLTEuNzk2IDEzLjM1OSwwLjU2NWM0LjQ1NywxLjc1NSAzLjY2NCwzLjYwMiAwLjk3Niw3LjM5NmMtNC43ODgsNi43NTkgLTYuNDI2LDkuMDI2IC04LjQ4OSw3LjQ1OWMtMS42MiwtMS4yMyAtMC41NTIsLTQuMTkxIC0wLjU1OCwtNC44NjdjLTAuMDE5LC0yLjIyMyAtMC41MzgsLTQuMDM0IC0xLjU4NCwtNS40MjlaIiBzdHlsZT0iZmlsbDojOTI0ZmFjOyIvPjxwYXRoIGQ9Ik0xNjEuOTAyLDU0LjIyNmMtMC4xNDQsMC40MTggLTAuNTMzLDAuODkxIC0wLjg5MSwxLjEwOWMtNS44MjcsMy41NTYgLTYuMDM1LDUuMjI0IC0xMi43NTEsMTIuMTA2Yy0xMi4zMDIsMTIuNjA2IC0yMy40MzgsMTMuNjUgLTI0LjU3LDEzLjkwOWMtMy4wNzQsMC43MDMgLTguOTA4LDAuMiAtMTAuMzU2LC0wLjIyYy03LjU2NSwtMi4xOTEgLTExLjM1NCwtNS4yNSAtMTQuNTQ2LC0xMS43NWMtMC42ODUsLTEuMzk1IC0xLjU0OCwtNS41ODkgLTEuNTUsLTUuNjA4Yy0wLjgyLC01Ljk3NSAtMC4xMDgsLTguNDY2IC0wLjA4NSwtOC41OTljMC4yOTksLTEuNjkxIC0wLjk4NSwtMC43NjIgLTMuMTk5LDAuNDU4Yy00Ljg1NCwyLjY3MyAtNC40MjYsLTIuNzk4IC0zLjk4LC0zLjc4NWMxLjkzNiwtNC4yNzkgNS4zMzMsLTUuNDQ5IDguMjA2LC03LjA5NGMxLjA3NiwtMC42MTYgMC41OSwtMi43OTMgMy4xMjksLTkuNjMzYzMuMDYyLC04LjI0OCA1LjMxLC0xMS4xMDMgNy4zNiwtMTQuMjcyYzMuMjY5LC01LjA1NCA3Ljk4OSwtMTAuMDk1IDExLjcwMywtMTMuMTAxYzExLjY3OCwtOS40NTEgMjMuMjQ1LC04LjU2NiAyNy41MTgsLTYuMDk1YzguMTg1LDQuNzM0IDUuMDY2LDEzLjk2OCA0LjUzMiwxNS43NjVjLTAuNjMsMS42IC0wLjgyMiwyLjc1NSAtMy4xNzIsNi4zNDZjLTAuNzc5LDEuMTkgLTQuNzQyLDcuMjQ1IC0xMi40MzMsMTIuNzAyYy05LjM0NSw2LjYzMSAtMjAuMzgsMTAuNjI5IC0yMy42NTcsMTEuODk4Yy0xLjQ2LDAuNTY1IC0xLjE2OSwwLjkwNSAtMS4zMDQsMS43MDVjLTAuOTMxLDUuNTQ0IC0wLjY3NSw4LjE5MiAwLjcwNCwxMS45NzhjMi4xODQsNS45OTggMTIuNjI4LDEwLjUyNyAyNS4zNTQsMS43MjJjNi45MTIsLTQuNzgyIDExLjc2NiwtMTEuNTcxIDE5LjU1NCwtMTUuMjM0YzAuMjAxLC0wLjA5NSAwLjg0NSwtMC40MDMgMS40MywtMC4yNzVjMC40OTUsMC4xMDkgMC43ODgsMC4zMSAwLjkyLDAuNDhjMC40MzUsMC41NTkgMC43NTMsMC44ODEgMS4wODEsMS40OThjMC41NDgsMS4wMzMgMC44NjEsMS43NTkgMS4wMzYsMi40MWMwLjE3OSwwLjY2NiAwLjExOSwxLjEzMSAtMC4wMzYsMS41OFptLTQ2LjUzNSwtMTguMjI1Yy0wLjk5NSwyLjczNCAtMS4wNDEsMi44OTUgLTAuOCwyLjkyOWMwLjI2MSwwLjAzNyAxMC4xNjUsLTMuNzg1IDE1LjQwNSwtNy4zODNjMC4yNSwtMC4xNzEgOC4wNDUsLTQuNzE5IDExLjcxMSwtMTIuNTVjMy4yNDMsLTYuOTI4IDAuNjczLC0xMC4yMzYgLTEuNDc5LC0xMC41MjhjLTEzLjE4MiwtMS43ODcgLTIzLjY4OSwyMy4zMjcgLTI0LjgzNywyNy41MzFaIiBzdHlsZT0iZmlsbDojZmQ3ZDU5OyIvPjwvc3ZnPg==" alt="Emerson">
+    </div>
+    <div class="login-heading">Podcast Editor</div>
+    <div class="login-sub">Acesso restrito</div>
 
-<main>
+    <div class="login-field">
+      <label class="login-label">Usuário</label>
+      <input class="login-input" type="text" id="loginUser" placeholder="seu usuário" autocomplete="username">
+    </div>
+    <div class="login-field">
+      <label class="login-label">Senha</label>
+      <input class="login-input" type="password" id="loginPass" placeholder="••••••••" autocomplete="current-password">
+    </div>
 
-  <!-- UPLOAD -->
-  <div class="upload-zone" id="uploadZone">
-    <input type="file" id="fileInput" accept="video/*,audio/*">
-    <div class="upload-icon">🎙</div>
-    <div class="upload-title">Arraste o vídeo do podcast aqui</div>
-    <div class="upload-sub">ou clique para selecionar · <strong>MP4, MOV, MKV, M4A, MP3</strong> · até 2GB</div>
+    <div class="login-error" id="loginError"></div>
+    <button class="login-btn" onclick="doLogin()">Entrar</button>
+
+    <hr class="login-divider">
+    <div class="login-footer">
+      Emerson Healthtech · Plataforma interna
+    </div>
   </div>
+</div>
 
-  <!-- PROGRESS -->
-  <div id="progress-section">
-    <div class="progress-card">
-      <div class="prog-header">
-        <div class="prog-spinner" id="progSpinner"></div>
-        <div>
-          <div class="prog-title" id="progTitle">Processando...</div>
-          <div class="prog-msg" id="progMsg">Aguarde</div>
-        </div>
+<!-- ══ APPROVAL SCREEN ══════════════════════════════════════ -->
+<div id="approval-screen">
+  <div class="approval-box">
+    <div class="approval-icon">🎙</div>
+    <div class="approval-heading">Aguardando autorização</div>
+    <div class="approval-sub">
+      Um administrador precisa aprovar seu acesso.<br>
+      Aguarde a confirmação ou entre em contato.
+    </div>
+
+    <div class="approval-user-badge">
+      <div class="badge-avatar" id="approvalAvatar">—</div>
+      <div class="badge-info">
+        <div class="badge-name" id="approvalName">—</div>
+        <div class="badge-role" id="approvalRole">Editor</div>
       </div>
-      <div class="prog-bar-wrap"><div class="prog-bar" id="progBar" style="width:0%"></div></div>
-      <div class="prog-pct" id="progPct">0%</div>
+    </div>
+
+    <!-- Botões visíveis apenas para admin -->
+    <div class="approval-actions" id="approvalActions" style="display:none">
+      <button class="btn-approve" onclick="approveAccess()">✓ Autorizar acesso</button>
+      <button class="btn-deny"    onclick="denyAccess()">Negar</button>
+    </div>
+
+    <div class="approval-pending-msg" id="approvalPending">
+      <div class="pending-dot"></div>
+      Aguardando aprovação do administrador
+    </div>
+  </div>
+</div>
+
+<!-- ══ MAIN APP ══════════════════════════════════════════════ -->
+<div id="main-app" style="display:none">
+
+<div id="topbar">
+  <div class="topbar-logo">
+    <img src="data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9Im5vIj8+PCFET0NUWVBFIHN2ZyBQVUJMSUMgIi0vL1czQy8vRFREIFNWRyAxLjEvL0VOIiAiaHR0cDovL3d3dy53My5vcmcvR3JhcGhpY3MvU1ZHLzEuMS9EVEQvc3ZnMTEuZHRkIj48c3ZnIHdpZHRoPSIxMDAlIiBoZWlnaHQ9IjEwMCUiIHZpZXdCb3g9IjAgMCAyNjQgMTQ0IiB2ZXJzaW9uPSIxLjEiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkveGxpbmsiIHhtbDpzcGFjZT0icHJlc2VydmUiIHhtbG5zOnNlcmlmPSJodHRwOi8vd3d3LnNlcmlmLmNvbS8iIHN0eWxlPSJmaWxsLXJ1bGU6ZXZlbm9kZDtjbGlwLXJ1bGU6ZXZlbm9kZDtzdHJva2UtbGluZWpvaW46cm91bmQ7c3Ryb2tlLW1pdGVybGltaXQ6MjsiPjxwYXRoIGQ9Ik0yNDcuMTIyLDExMy41OTZjLTAuNjE5LDAuMDExIC0wLjkzMywtMC4wMTUgLTEuNTU2LDAuMTUyYy0xLjYxNCwwLjQzNCAtMi42NjUsMC44NzQgLTQuMDI4LDIuODE0Yy0xLjExLDEuNTggLTEuNjQyLDQuNjAzIC0xLjcwMiw1LjI3NGMtMC40MTQsNC42MyAtMC4wNjIsMTEuNDAyIC0wLjA1OSwxMS41MmMwLjA1NCwyLjQwOSAwLjE4NiwyLjM5NiAwLjMxMSwzLjc2M2MwLjM5MSw0LjI4IDAuNDA3LDQuMzA2IDAuMjA5LDQuNzI2Yy0wLjI3NCwwLjU4IC0xLjEwMSwwLjUxOSAtNC4xNDgsMC41MTljLTYuMzczLDAuMDAxIC02LjQzOSwwLjA0IC02LjgzOSwtMC4zMDVjLTAuODIzLC0wLjcwNyAtMC40ODMsLTEuNzIxIC0wLjM3NywtMi40NTZjMC4wNDQsLTAuMzAxIDAuNjc1LC0xMC4zNjIgMC43MjYsLTE1LjYzMmMwLjA3NCwtNy43NjQgLTAuMDM2LC05LjIwOCAtMC4wOTcsLTEwLjAwNmMtMC4yNDIsLTMuMTcyIC0wLjIyNywtMy4xNyAtMC4yNTUsLTMuNDQ1Yy0wLjAyNiwtMC4yNSAtMC4yODQsLTIuNzExIC0wLjM1NiwtMy4xMjNjLTAuMjQyLC0xLjM2OCAtMC4zMTUsLTEuODY2IDEuOTA0LC0yLjQwMWMxLjQwNywtMC4zMzkgMS4zOCwtMC40NDEgMi44MDcsLTAuNjU3YzAuNTMzLC0wLjA4MSAxLjA1NSwtMC4zNjIgMi44MTYsLTAuNTk0YzAuOTc0LC0wLjEyOCAzLjIzMSwtMS4wODcgMy4xODEsMS40NjVjLTAuMDQ1LDIuMjM4IC0wLjU0LDQuMTcgLTAuNTY2LDQuNDdjLTAuMDQ2LDAuNTM4IC0wLjEwOSwwLjUzMSAtMC4wOTYsMC41NzZjMC4wMjcsMC4wOTEgMC4xMTYsMC4xNiAwLjIwMSwwLjIwM2MwLjA1NCwwLjAyOCAwLjEzMSwwLjAyNSAwLjE4MiwtMC4wMDdjMC4xMDksLTAuMDY4IDAuNDU3LC0wLjgwOSAxLjEyMSwtMi4xMzVjMC4zMTMsLTAuNjI2IDEuNjcxLC0yLjIxNiAyLjY1MSwtMi45NmMwLjkzNSwtMC43MDkgMC45NTYsLTAuNjcyIDEuOTgsLTEuMjQyYzQuODA4LC0yLjY3OSA5LjY5NywtMC45NjkgOS44MjIsLTAuOTM2YzEuNTY5LDAuNDEzIDMuMTE1LDEuMzA3IDMuNDc3LDEuNjIzYzIuNTI1LDIuMjAzIDMuNTk1LDQuNjg2IDQuMzM5LDkuNzhjMC4zODUsMi42MzMgLTAuMDg2LDE2LjA0NiAwLjM4NywxOS42OTdjMC4xNjIsMS4yNSAwLjA5MiwxLjI0OSAwLjIxLDIuNTExYzAuMTksMi4wMzMgMC4xMjcsMi4wMzMgMC4zMDksNC4wNjZjMC4wMDksMC4xMDMgMC4wODEsMC45MDggLTAuMzE4LDEuMjUzYy0wLjMyNCwwLjI4IC0wLjM3NywwLjI1IC02LjU2OSwwLjI1Yy0zLjk2MywtMCAtNC40NjMsMC4wODQgLTQuNzU4LC0wLjUyOGMtMC40MTQsLTAuODU4IDAuMTczLC00LjIxMSAwLjIzOCwtNy4yMzVjMC4wNDQsLTIuMDU3IDAuMTI1LC0yLjA0OCAwLjIxMywtNC4zN2MwLjM3OSwtOS45OSAwLjQyOCwtOS4xNzIgLTAuMTQ0LC0xMS44Yy0wLjk1OSwtNC40MDcgLTMuNDM0LC00Ljc3MyAtNS4yMTQsLTQuODMzWiIgc3R5bGU9ImZpbGw6I2ZkN2Q1OTsiLz48cGF0aCBkPSJNNTAuMzY0LDEwNS40OTJjMC4yMzcsLTAuMjM2IDEuOTkzLC0xLjU2NSAyLjE1OCwtMS42NDljMC4xODksLTAuMDk2IDEuNDI4LC0wLjc4MSAxLjkyNCwtMC44NzdjMC42NywtMC4xMyAwLjk5NywtMC40NjkgNC43MDUsLTAuMzVjMS4yNjcsMC4wNDEgMy4xNjQsMC43MSA0LjAwNSwxLjE0YzAuMDQ1LDAuMDIzIDEuMjE1LDAuODk2IDEuMjQ3LDAuOTJjMC40NjcsMC4zNTIgMS45OTYsMi4yNyAyLjA0MywyLjM0NmMwLjA3NiwwLjEyMyAwLjgzNCwxLjQxIDEuMDM2LDEuNzIzYzAuMTU3LDAuMjQ0IDAuMTUzLDAuMzA3IDAuNDM5LDAuMjc4YzAuMjcxLC0wLjAyNyAwLjE4OCwtMC4xNDIgMC40MDUsLTAuNjI5YzAuMDg5LC0wLjE5OSAwLjYyNSwtMS4xODYgMS4yNDksLTEuODMxYzAuMDc0LC0wLjA3NiAxLjA0NiwtMC45OTggMS40NTMsLTEuMzk5YzAuMDUsLTAuMDQ5IDEuOTcyLC0xLjUyIDQuMDc1LC0yLjEyN2MwLjM3MiwtMC4xMDcgMS4zNzgsLTAuNTIgNC42ODcsLTAuNDI5YzAuOTU4LDAuMDI2IDIuNzc3LDAuNTMyIDMuMTQ0LDAuNjE1YzEuMDUsMC4yMzYgMy45ODcsMS44NiA1LjQ5OCw0LjIzYzAuNjczLDEuMDU2IDEuMTExLDIuOTE5IDEuMzQzLDMuNzAyYzAuMTI5LDAuNDM2IDAuMzg4LDEuNjIzIDAuNjIyLDMuNzUyYzAuMTExLDEuMDA4IC0wLjAyMiwxNC42NDkgMC4yMzUsMTUuOTY5YzAuMzgzLDEuOTcyIDAuNDMxLDYuODU4IDAuNTI1LDguMDk4YzAuMDYxLDAuNzk5IDAuMjI0LDAuNzcyIDAuMjU2LDEuNTY5YzAuMDY1LDEuNTk1IC0wLjM1LDEuNTQ3IC0wLjM3NCwxLjU1OWMtMC40NTEsMC4yMzQgLTAuNDI2LDAuMyAtMC45MjcsMC4zNjdjLTAuNjcsMC4wOSAtMC42NzEsMC4wMzIgLTguNDQ5LDAuMDEyYy0wLjM0NCwtMC4wMDEgLTIuMjQ5LDAuMjgyIC0yLjI3NCwtMS42MjNjLTAuMDMzLC0yLjQ1MyAwLjEyNSwtMy4xNDggMC4xODUsLTMuNDE1YzAuMTQ5LC0wLjY1OCAwLjM3NCwtNS44IDAuMzkzLC02LjU5OGMwLjEwOSwtNC41MzcgMC4wMDcsLTQuNTMxIDAuMDk2LC05LjA2NWMwLjAxNywtMC44NzkgMC4xODQsLTMuNDk3IC0wLjE3MywtNC44MzJjLTAuMTE2LC0wLjQzMyAtMC4xNjQsLTEuMDg4IC0wLjg0NCwtMi40MDljLTAuMDk1LC0wLjE4NSAtMC45NzMsLTEuMjI2IC0xLjc3MSwtMS42MDZjLTEuOTMyLC0wLjkyMSAtMy4zNTYsLTAuNDU3IC0zLjc0OCwtMC4zNDRjLTEuMDY3LDAuMzA3IC0xLjEwOSwwLjQxMiAtMS4zMDcsMC41MzljLTAuMzYyLDAuMjM0IC0xLjY3MiwxLjM3IC0yLjM0MSwzLjI0NmMtMC40NzYsMS4zMzQgLTAuNzc5LDIuMDg2IC0wLjgyNSwzLjgxNmMtMC4wMDUsMC4xODMgLTAuMDgzLDAuMTc3IC0wLjA5NSwzLjc3OWMtMC4wMTQsNC40ODUgMC40NjgsMTIuODQ1IDAuNzIsMTQuMDk4YzAuMTA5LDAuNTQyIDAuMTU3LDAuNTM1IDAuMjA5LDIuNDcyYzAuMDM0LDEuMjY1IC0wLjI0MSwxLjY3MSAtMC43NSwxLjg0OGMtMC4yNjQsMC4wOTIgLTEuODEyLDAuMTA2IC00LjA1MSwwLjEwOWMtNi4wODcsMC4wMDcgLTYuMTI2LDAuMDE1IC02LjU5OSwtMC4zNTNjLTAuOTIyLC0wLjcxOSAtMC41MzIsLTIuMzQ3IC0wLjQ5LC0yLjUwNmMwLjIwMSwtMC43NTggMC4wNjksLTEuNTEgMC4yMjgsLTIuMjE2YzAuNDU3LC0yLjAyOCAwLjU1NCwtMTUuMDA5IDAuNTI0LC0xNi44OTFjLTAuMDM2LC0yLjIzMyAtMC4wNzMsLTAuNzY4IC0wLjIxMywtMS42OGMtMC4xNDcsLTAuOTUzIC0wLjAxNSwtMC44MSAtMC4yMjksLTEuNTljLTAuMzMzLC0xLjIxNSAtMC45NTUsLTIuNzMyIC0xLjI1OCwtMy4xNTVjLTAuOTk2LC0xLjM5MyAtMS43NzksLTEuODc2IC00LjE1NSwtMS43MzdjLTAuMTU1LDAuMDA5IC0wLjYzLDAuMDM3IC0xLjgyLDAuNjU4Yy0wLjI0NiwwLjEyOSAtMS41MjIsMS4wNzkgLTIuMTQxLDIuMjA5Yy0wLjE1MywwLjI4IC0wLjIsMC4yOSAtMC4zNDgsMC44MjhjLTAuMDE1LDAuMDU0IC0wLjIzOCwwLjYxNiAtMC40OSwxLjUwOGMtMC4yMjEsMC43ODEgLTAuNzE3LDQuNjA4IC0wLjY3NSw4LjU4OWMwLjAwOCwwLjc5MiAwLjM3LDkuMTczIDAuNDExLDkuOTYyYzAuMDksMS43MjQgMC4zODEsMi42ODMgMC40MzcsMy40NzhjMC4xNjIsMi4yNjggLTAuMTE1LDIuMzcgLTAuMzgsMi41MTFjLTAuNzU5LDAuNDA0IC0wLjc5NCwwLjM5NSAtNC4zODIsMC4zOWMtNi4xMzUsLTAuMDA4IC02LjE4OSwwLjAzMSAtNi42MjQsLTAuMzE3Yy0wLjE1NiwtMC4xMjUgLTAuNDU3LC0wLjE3NCAtMC4zODksLTEuNjQ1YzAuMDcyLC0xLjU2NCAwLjIyNCwtMi4yNjMgMC41MjksLTMuNTI1YzAuMjY1LC0xLjA5MiAwLjExMywtNS45NTggMC4xMjQsLTExLjE3YzAuMDIsLTkuMTUzIDAuMDM4LC0xMy45NzIgLTAuMTA5LC0xNC43MjNjLTAuMTc5LC0wLjkxMyAtMC40NjksLTIuOTI2IC0wLjUwNSwtNC4wMzdjLTAuMDM1LC0xLjA4MSAwLjA4NCwtMS4zOTIgMC40MTYsLTEuNTU1YzAuMTkzLC0wLjA5NCAwLjE3NiwtMC4xMTMgMC4zNiwtMC4yMTRjMC40MTcsLTAuMjI4IDMuNzgxLC0xLjA4MiA0LjMxMiwtMS4xMzljMC43OTksLTAuMDg1IDIuMzM0LC0wLjU0NSAzLjEzLC0wLjYxNWMyLjM0NCwtMC4yMDYgMi41MzEsMC4zNzEgMi41MzEsMC4zNzFjMCwwIDAuMjUxLDAuMzE1IDAuMjY3LDAuMzQ2YzAuMTUzLDAuMjgzIDAuMTI2LDEuMzAxIDAuMTA0LDIuMThjLTAuMDI0LDAuOTg1IC0wLjU2MywxLjg5NiAtMC43NTMsMy4wMjNjLTAuMDgzLDAuNDk0IC0wLjE0OSwwLjc0MiAwLjM0MiwwLjY1N2MwLjE4MiwtMC4wMzIgMC4yODgsLTAuMzEzIDAuMzAxLC0wLjM0N2MwLjEyNCwtMC4zMyAwLjEzNSwtMC4zMjEgMC4yOTMsLTAuNjRjMC4wNSwtMC4xMDEgMC41ODUsLTEuNDQ4IDEuMDA2LC0yLjA1OGMwLjQxOCwtMC42MDYgMS4yOCwtMS4zNjYgMS41MTgsLTEuNjA0WiIgc3R5bGU9ImZpbGw6I2ZkN2Q1OTsiLz48cGF0aCBkPSJNMjE2Ljg3MSwxMDUuMzczYzAuMDU5LDAuMDQ4IDMuODUxLDIuMjEgNi44MjEsOC44OTNjMC40MDQsMC45MDkgMC4yMzIsMC45NiAwLjU1NiwxLjg5M2MwLjA2MywwLjE4MiAwLjEwMywwLjU2IDAuMTA4LDAuNjFjMC4wOTksMC45NTMgMC41NTQsMi41NCAwLjU5LDQuMDczYzAuMDA1LDAuMjAxIDAuMDc2LDQuMzMyIC0wLjA3NSw1LjAwMWMtMC4yNzcsMS4yMjggLTAuMDUzLDEuMjY2IC0wLjM5NywyLjQ3M2MtMC4yMiwwLjc3MSAtMC4wOSwwLjc5MyAtMC4zMTUsMS41NjJjLTAuMTgyLDAuNjI0IC0wLjEsMC42MzkgLTAuMzE1LDEuMjQ1Yy0wLjE4NiwwLjUyNSAtMC4xNDksMC41MzYgLTAuNDAyLDEuMDNjLTAuMTUxLDAuMjk0IC0wLjQxNSwxLjA5NiAtMC40NDcsMS4xOTJjLTAuMDI5LDAuMDg5IC0wLjA0OSwwLjE4MiAtMC4wOTUsMC4yNjNjLTAuMDI1LDAuMDQ0IC0wLjA4NywwLjA1OCAtMC4xMTMsMC4xMDFjLTAuMDQ4LDAuMDc5IC0wLjA1MSwwLjE4MiAtMC4xMDQsMC4yNThjLTAuMDM1LDAuMDUgLTAuMTExLDAuMDU5IC0wLjE0OCwwLjEwN2MtMC4xNjMsMC4yMTIgLTIuMzIsNy4xNjkgLTEyLjAyMyw5LjA3NmMtMC42MzQsMC4xMjUgLTAuNjM5LDAuMDQ1IC0xLjI2MiwwLjE5NGMtMC4yMzksMC4wNTcgLTMuNDYyLDAuMjE2IC00LjY1NiwtMC4wODhjLTAuOTIzLC0wLjIzNSAtMC45NjIsLTAuMDE0IC0xLjg2OCwtMC4zMTdjLTAuNzksLTAuMjY0IC0xLjY4MiwtMC41MzEgLTEuODY0LC0wLjYyNWMtMC40OTksLTAuMjU5IC0wLjQ5MiwtMC4yNjkgLTEuMjk1LC0wLjUzNWMtMC4zMzksLTAuMTEzIC0wLjMwNCwtMC4xNzQgLTAuNjI5LC0wLjMwMmMtMC4wODYsLTAuMDM0IC0wLjE3OCwtMC4wNTggLTAuMjU4LC0wLjEwNWMtMC4wNDQsLTAuMDI2IC0wLjA2MiwtMC4wODMgLTAuMTA2LC0wLjEwOWMtMC4wNzksLTAuMDQ3IC0wLjE3OSwtMC4wNTUgLTAuMjU1LC0wLjEwN2MtMC4wNSwtMC4wMzQgLTAuMDYzLC0wLjEwNiAtMC4xMTEsLTAuMTQyYy0wLjI0NywtMC4xODYgLTAuNzYzLC0wLjQ0MiAtMC44MzEsLTAuNDc2Yy0wLjI3NywtMC4xMzggLTAuNjE5LC0wLjQ2OSAtMC42OTUsLTAuNTE4Yy0wLjA3NCwtMC4wNDggLTAuMTY5LC0wLjA2IC0wLjIzOSwtMC4xMTRjLTAuMDUzLC0wLjA0MSAtMC4wNjcsLTAuMTE4IC0wLjExOCwtMC4xNjFjLTAuMDY0LC0wLjA1MyAtMC4xNTgsLTAuMDY0IC0wLjIyLC0wLjExOWMtMC4wNTMsLTAuMDQ3IC0wLjA2NSwtMC4xMjkgLTAuMTE3LC0wLjE3N2MtMC4xNzIsLTAuMTYyIC0wLjI2MSwtMC4xNzEgLTAuMzg5LC0wLjI2MWMtNy4zNSwtNS4yMjYgLTYuMzk3LC0xNy41MzUgLTYuMzM1LC0xOC4zMzZjMC4xOTEsLTIuNDU4IDAuNjgxLC00LjE1NCAwLjg1MiwtNS4wMjJjMC4xMDUsLTAuNTM0IDAuMTU0LC0wLjUxMyAwLjcwNCwtMi4xN2MwLjAzLC0wLjA4OSAwLjA1MywtMC4xODIgMC4wOTgsLTAuMjY1YzAuMDIyLC0wLjA0MSAwLjA3NiwtMC4wNiAwLjA5OCwtMC4xMDFjMC4xMzYsLTAuMjQ5IDAuMDcsLTAuMjcxIDAuMjExLC0wLjUyNWMwLjAyMywtMC4wNDIgMC4wNzMsLTAuMDY1IDAuMDk1LC0wLjEwOGMwLjA4NCwtMC4xNjcgMC4xMzMsLTAuMzQ5IDAuMjE4LC0wLjUxNWMwLjAyMywtMC4wNDUgMC4wOCwtMC4wNjUgMC4xMDMsLTAuMTA5YzAuMDg0LC0wLjE2NiAwLjEyNiwtMC4zNSAwLjIxMiwtMC41MTVjMC4wMjQsLTAuMDQ1IDAuMDg2LC0wLjA2MSAwLjExMiwtMC4xMDVjMC4wNDgsLTAuMDc5IDAuMDU0LC0wLjE4IDAuMTA1LC0wLjI1NmMwLjAzMywtMC4wNDkgMC4xMDUsLTAuMDYxIDAuMTQsLTAuMTA4YzAuMDI0LC0wLjAzMyAwLjEzLC0wLjQ1MiAwLjg3MywtMS40MDdjMi42MTcsLTMuMzY0IDYuNDksLTUuNDQ0IDcuMSwtNS42ODljMC40NjMsLTAuMTg2IDAuNDM2LC0wLjI0OSAwLjkyMSwtMC4zNzNjMC40ODgsLTAuMTI0IDAuNDU2LC0wLjIxNCAwLjk0NSwtMC4zMDZjMC4xOTcsLTAuMDM3IDAuNCwtMC4wNDQgMC41OTQsLTAuMDkzYzAuMTI2LC0wLjAzMiAwLjIzNywtMC4xMDggMC4zNiwtMC4xNDhjMC4wNDcsLTAuMDE2IDAuMjE4LC0wLjA3MiAwLjYxMSwtMC4xMDZjMC42NDQsLTAuMDU2IDAuNjQsLTAuMDU3IDEuMjY1LC0wLjIwNGMwLjcxNiwtMC4xNjkgMy44OTgsLTAuMTk1IDQuNjgxLC0wLjAwNGMwLjc3OCwwLjE5IDAuNzg5LDAuMDk4IDEuNTc4LDAuMjQxYzAuMTAyLDAuMDE4IDAuMDg2LDAuMDc3IDEuMjUzLDAuMzA3YzAuOTA4LDAuMTc5IDIuMDY0LDAuNzkxIDIuMjM0LDAuODgxYzAuMjQ5LDAuMTMyIDAuMjY2LDAuMDgzIDAuNTE0LDAuMjI1YzAuODEsMC40NjEgMS40OTgsMC43NjggMS42MDksMC44NDdjMC4wNTIsMC4wMzggMC4wNywwLjExMSAwLjEyLDAuMTUyWm0tMi4xNzksMTkuNzIyYy0wLjEwMywtMy44MjEgMC4xNDIsLTEzLjk5MSAtNy45MzMsLTEzLjk1M2MtNS41MjQsMC4wMjYgLTcuNjU0LDYuMjcyIC03LjU0MywxNC4wOThjMC4wNDMsMy4wNDQgMS4yNDIsMTAuMDQxIDguMTU4LDkuODk0YzQuOTM1LC0wLjEwNSA3LjQyLC02LjIxNyA3LjMxOCwtMTAuMDM4WiIgc3R5bGU9ImZpbGw6I2ZkN2Q1OTsiLz48cGF0aCBkPSJNMTg0LjAzNCwxMTAuODZjMC4wMDcsMC4zIC0wLjA4MywwLjQwMyAtMC4zNTgsMC44MjZjLTAuMzksMC42MDIgLTEuNzc0LDAuNTE5IC0zLjUzNiwtMC4xNzdjLTUuMzA1LC0yLjA5NCAtMTAuODI2LC0xLjMxNyAtMTAuNzE2LDIuMTQ2YzAuMTI4LDQuMDAzIDMuNjEyLDMuNzIzIDUuNzQ3LDQuNTg3YzIuNTM3LDEuMDI3IDguNTE0LDMuNTI3IDEwLjcxNiw5Ljc2NWMwLjg1MSwyLjQxMiAwLjYxMiw0LjM0NyAwLjU2NSw0LjcyNWMtMC4xMTEsMC44OTQgLTAuNjA1LDYuODQgLTcuNTk3LDkuNTQ0Yy0xLjAzMiwwLjM5OSAtMi44NDQsMC43MjEgLTMuMzY0LDAuODI0Yy0wLjU3NCwwLjExNCAtNC45ODIsMC40ODggLTguMTY0LC0wLjI2MmMtMC45MiwtMC4yMTcgLTEuMzQ4LC0wLjE2NiAtMi41MDEsLTAuNjc2Yy0xLjEzNSwtMC41MDIgLTIuODY5LC0xLjYzNCAtMy45ODgsLTIuMzk3Yy0wLjY4NywtMC40NTcgLTEuMTIzLC0xLjIwOCAtMS4xOCwtMi4wMzFjLTAuMDcyLC0xLjA1IC0wLjE1MiwtMi42MTkgLTAuMTQ4LC00LjJjMC4wMDEsLTAuNTI0IDAuMDk5LC0xLjcwNyAxLjA4MSwtMS43NDNjMC44MDksLTAuMDMgMS4xMDYsLTAuMTY1IDIuNDA1LDAuNzY3YzAuMDk3LDAuMDcgMS4xNjcsMC44MjggMy4zNTcsMS44NDljNS4wMTMsMi4zMzcgOC44NjQsMi4wMyAxMC4xNjYsLTAuMjI5YzAuMjI1LC0wLjM5IDAuMzU0LC0wLjY2MyAwLjM3OSwtMS41OTJjMC4wODgsLTMuMjI0IC0zLjA0NywtNC4zODIgLTQuNTc2LC01LjEwOWMtMS4yNjYsLTAuNjAyIC0xLjIzOSwtMC42NDYgLTIuNTE2LC0xLjIyN2MtMC4yMjQsLTAuMTAyIC00LjAxNSwtMS45NSAtNS4yMzcsLTIuOTUxYy0xLjA0LC0wLjg1MSAtMS40NTcsLTEuMTg3IC0yLjYxNiwtMi43MWMtMS41MTYsLTEuOTkyIC0yLjMxNiwtNS4zODIgLTEuODc5LC03Ljg4N2MwLjA3NiwtMC40MzYgMC4yNjIsLTMuODE1IDMuNzI5LC02Ljk5M2MxLjE1NiwtMS4wNiAxLjI1OCwtMC45MTIgMi42NDQsLTEuNjY5YzAuODksLTAuNDg3IDQuNjUxLC0xLjU5NyA3Ljg0MSwtMS4yNTdjMy4wMzcsMC4zMjMgNS40NzksMS4wMTggNy4wODYsMS41OTFjMS4zMjYsMC40ODMgMi4yNTEsMS42OTIgMi4zNywzLjA5OGMwLjEzMywxLjMxMSAwLjI3NCwyLjgyNSAwLjI4OCwzLjM4N1oiIHN0eWxlPSJmaWxsOiNmZDdkNTk7Ii8+PHBhdGggZD0iTTE0NC43MDksMTQwLjg2NmMtMC4wMDIsMC4xMDEgMC4wMTIsMC4yMDIgMC4wMSwwLjMwM2MtMC4wMzMsMS40NDUgLTIuMTk1LDEuMTkgLTIuNjk5LDEuMTkxYy0wLjg3NywwLjAwMiAtNy42MjksMC4wMDUgLTcuODE0LC0wLjAwOWMtMS4yNCwtMC4wOTYgLTEuMjEsLTEuMzM4IC0xLjIwNiwtMS40OTFjMC4wNDIsLTEuNzI5IDAuMjg4LC0xLjcwNSAwLjM2NiwtMy40MzNjMC4yMjIsLTQuODc3IDAuNTE4LC04LjcyMiAwLjU0NiwtMTAuNjQxYzAuMTU0LC0xMC44ODkgMC4wNzIsLTEwLjg4OSAtMC40NDYsLTE2LjU2M2MtMC4xMDEsLTEuMTAyIDAuMDMyLC0xLjIzNiAtMC4zMjIsLTIuODAzYy0wLjQ1NSwtMi4wMTggMC40NjYsLTEuOTg2IDMuODc1LC0yLjgyNWMwLjkyMywtMC4yMjcgMC45MzYsLTAuMTUxIDEuNTU5LC0wLjMyOGMwLjM1NywtMC4xMDIgMy43NDgsLTEuMDY4IDQuNjM2LC0wLjI1MWMxLjAzMywwLjk1MSAwLjY1OCwxLjg2NiAwLjU5Nyw1LjI1N2MtMC4wMzMsMS44MjcgLTAuMjA2LDIuNTkyIC0wLjI1NiwyLjgxMmMtMC4wMTEsMC4wNDkgLTAuMTM0LDAuNTkxIC0wLjEzLDAuNjEzYzAuMDA3LDAuMDQ1IDAuMDgzLDAuNTI5IDAuNDcxLDAuMzI3YzAuMTU4LC0wLjA4MiAwLjcxNCwtMi41NTUgMi43MjgsLTUuMzczYzAuNzcsLTEuMDc4IDAuNzQ3LC0xLjI2NyAyLjQ3NSwtMi44N2MwLjE0MywtMC4xMzMgMC44NDQsLTAuNzgzIDIuMDU4LC0xLjMxNGMxLjUxNSwtMC42NjMgMi41MjIsLTAuNjgxIDIuNzQ5LC0wLjY4NmMxLjI5LC0wLjAyMyA0LjE4NywwLjQwMyA0LjE2OCwyLjQyNmMtMC4wMDMsMC4zNDYgLTAuMTQxLDEuMTQ1IC0wLjE3OCwxLjU1NGMtMC4xMzUsMS41MzEgLTAuNTY5LDMuMzk1IC0wLjYxMiwzLjc1Yy0wLjI2NSwyLjE4MyAtMC40MDIsMi44OTUgLTIuMDgxLDIuNDI4Yy0xLjI2OSwtMC4zNTIgLTYuMTA3LDAuNjEyIC04LjcxMiw1LjQ1M2MtMS43MzMsMy4yMjIgLTIuMjksNi44OSAtMi40NjEsOC4yODVjLTAuNDM1LDMuNTUxIC0wLjE2NCw5LjIzNiAwLjY3OSwxNC4xODRaIiBzdHlsZT0iZmlsbDojZmQ3ZDU5OyIvPjxwYXRoIGQ9Ik0xMy4zODQsMTMxLjg5N2MwLjMyNCwwLjMyMSAwLjMwNCwwLjMzOCAwLjY2OSwwLjYxNGMwLjYwNiwwLjQ1OCAxLjIyMywwLjg3OSAyLjIxLDEuMjU3YzEuMzk1LDAuNTM0IDEuOTE0LDAuNDY4IDIuMjI1LDAuNTQzYzAuODI5LDAuMiAwLjgzMywwLjE4NiAyLjgxOSwwLjE3MmMwLjc5NCwtMC4wMDYgMi42MjIsLTAuMjk3IDIuNzc0LC0wLjM0M2MwLjAwMywtMC4wMDEgMS4wMDUsLTAuMzI0IDEuNTg1LC0wLjU0OWMwLjgsLTAuMzExIDIuNDYyLC0xLjA5MSAyLjg5NCwtMS4zOTRjMC41MjcsLTAuMzcgMC41MjcsLTAuMzY2IDAuNTczLC0wLjM5N2MwLjk5MiwtMC42NjcgMS44LC0wLjk1NCAyLjE3MywtMC45MDZjMC4yNTMsMC4wMzIgMC42MjEsMC4xODQgMC43NjIsMC40NDFjMC4yMjYsMC40MTEgMC42NjcsMS4wNDMgMC41OTIsMi4wMjZjLTAuMDIzLDAuMjk5IC0wLjA0NiwwLjU3MiAtMC4yMDcsMC44NzZjLTAuMDIyLDAuMDQxIC0xLjM2NiwyLjU4MyAtMi4xODMsMy4zODhjLTAuMjExLDAuMjA3IC0xLjg4NSwxLjg1NSAtMi4wNSwyLjAxNmMtMC43NDUsMC43MyAtMS42MDUsMS4zMzUgLTEuNjk0LDEuNDAzYy0wLjAzMywwLjAyNSAtMC45MDUsMC40NzMgLTEuMjA3LDAuNjVjLTAuMDk2LDAuMDU2IC0wLjEwNCwwLjAzNyAtMS4yNDgsMC42MTljLTAuMTY3LDAuMDg1IC0xLjE2MiwwLjQwMyAtMS44MDUsMC41MzdjLTAuMzgyLDAuMDggLTIuMDMsMC41NCAtMi44MzMsMC41NjFjLTMuNjI5LDAuMDk1IC01LjE1LC0wLjIyNiAtNS45NDksLTAuMjgyYy0wLjkzOCwtMC4wNjYgLTMuODgyLC0xLjA2NyAtNC4wMDMsLTEuMTM0Yy0wLjA0MywtMC4wMjQgLTMuMjExLC0yLjAxNiAtMy4zOTMsLTIuMTg1Yy0wLjAyOCwtMC4wMjYgLTEuNDMsLTEuMjg5IC0yLjAxMiwtMi4wNDhjLTAuNjU5LC0wLjg1OSAtMS44NjgsLTIuOTM3IC0xLjk0MSwtMy4xMDljLTEuNjI2LC0zLjgxNyAtMS44NDgsLTUuMTY5IC0yLjA3MSwtNy44NzNjLTAuMjI3LC0yLjc2NSAwLjE4NywtNi4yMTggMC43MDcsLTguNzE3YzAuNDU3LC0yLjE5NiAyLjM3NCwtNi4xOTcgMi40MTMsLTYuMjhjMC4xMiwtMC4yNTQgMy45NDUsLTkuNDQzIDE1LjMwNSwtOS4zNjdjMS41OTgsMC4wMTEgMTIuMzg3LDAuMjE1IDE0LjA1OCwxMy4xMThjMC4yNjYsMi4wNTMgMC4zNTUsNC44NSAtMC4wODcsNi4yMWMtMC4wNTEsMC4xNTcgLTAuNDg4LDEuNSAtMC44NzcsMS44NjZjLTAuMDYxLDAuMDU3IC0wLjE1MSwwLjA3NSAtMC4yMTgsMC4xMjZjLTAuMjU1LDAuMTkzIC0wLjI0OCwwLjI4NSAtMS4yOTksMC4yODljLTYuMjU5LDAuMDI0IC0xMC45MTYsMC4wMiAtMTQuMDksMC4wMmMtMy40MywtMCAtNS4xMjcsMC4wMDUgLTUuMjM5LDAuMDU2Yy0wLjA1MiwwLjAyNCAtMC4wNzQsMC4wODcgLTAuMTE1LDAuMTI3Yy0wLjExMSwwLjEwOSAtMC4yNCwwLjA5NyAtMC4xNjIsMS4yOThjMC4wNTEsMC43OTYgMC45NTksMy4zNjMgMS4wNDIsMy41MDVjMC4xNDYsMC4yNDkgMC44ODUsMS42OTIgMS4yNjYsMi4xOTZjMC4yNzYsMC4zNjQgMC4yOTIsMC4zNDMgMC42MTYsMC42NjlabTQuNTIxLC0xMy42OTdjMC44MzksLTAuMDA1IDEuNzMzLC0wLjAxIDMuNDA1LC0wLjAxNmMxLjU4OSwtMC4wMDUgMi4yMTcsLTAuMjIzIDIuMDYyLC0yLjk2MmMtMC4xNzIsLTMuMDE5IC0xLjkzNCwtNS41NjMgLTQuNTgzLC02LjA1NGMtMC4zMSwtMC4wNTcgLTMuNTYzLC0wLjYwMSAtNi4yMTIsMy4wNDJjLTAuNDc0LDAuNjUxIC0xLjkxMywyLjMyOCAtMi4xMTYsNS4xOWMtMC4wMDQsMC4wNTEgMC4wMiwwLjM2MSAwLjI1NCwwLjU4NWMwLjI4OSwwLjI3NiAwLjk3NywwLjIyNyAzLjQwMSwwLjIyNWMxLjkyOCwtMC4wMDEgMi44MjIsLTAuMDA1IDMuNzg5LC0wLjAxMVoiIHN0eWxlPSJmaWxsOiNmZDdkNTk7Ii8+PHBhdGggZD0iTTEwOC41MzUsMTMxLjg5N2MwLjMyNCwwLjMyMSAwLjMwNCwwLjMzOCAwLjY2OSwwLjYxNGMwLjYwNiwwLjQ1OCAxLjIyMywwLjg3OSAyLjIxLDEuMjU3YzEuMzk1LDAuNTM0IDEuOTE0LDAuNDY4IDIuMjI1LDAuNTQzYzAuODI5LDAuMiAwLjgzMywwLjE4NiAyLjgxOSwwLjE3MmMwLjc5NCwtMC4wMDYgMi42MjIsLTAuMjk3IDIuNzc0LC0wLjM0M2MwLjAwMywtMC4wMDEgMS4wMDUsLTAuMzI0IDEuNTg1LC0wLjU0OWMwLjgsLTAuMzExIDIuNDYyLC0xLjA5MSAyLjg5NCwtMS4zOTRjMC41MjcsLTAuMzcgMC41MjcsLTAuMzY2IDAuNTczLC0wLjM5N2MwLjk5MiwtMC42NjcgMS44LC0wLjk1NCAyLjE3MywtMC45MDZjMC4yNTMsMC4wMzIgMC42MjEsMC4xODQgMC43NjIsMC40NDFjMC4yMjYsMC40MTEgMC42NjcsMS4wNDMgMC41OTIsMi4wMjZjLTAuMDIzLDAuMjk5IC0wLjA0NiwwLjU3MiAtMC4yMDcsMC44NzZjLTAuMDIyLDAuMDQxIC0xLjM2NiwyLjU4MyAtMi4xODMsMy4zODhjLTAuMjExLDAuMjA3IC0xLjg4NSwxLjg1NSAtMi4wNSwyLjAxNmMtMC43NDUsMC43MyAtMS42MDUsMS4zMzUgLTEuNjk0LDEuNDAzYy0wLjAzMywwLjAyNSAtMC45MDUsMC40NzMgLTEuMjA3LDAuNjVjLTAuMDk2LDAuMDU2IC0wLjEwNCwwLjAzNyAtMS4yNDgsMC42MTljLTAuMTY3LDAuMDg1IC0xLjE2MiwwLjQwMyAtMS44MDUsMC41MzdjLTAuMzgyLDAuMDggLTIuMDMsMC41NCAtMi44MzMsMC41NjFjLTMuNjI5LDAuMDk1IC01LjE1LC0wLjIyNiAtNS45NDksLTAuMjgyYy0wLjkzOCwtMC4wNjYgLTMuODgyLC0xLjA2NyAtNC4wMDMsLTEuMTM0Yy0wLjA0MywtMC4wMjQgLTMuMjExLC0yLjAxNiAtMy4zOTMsLTIuMTg1Yy0wLjAyOCwtMC4wMjYgLTEuNDMsLTEuMjg5IC0yLjAxMiwtMi4wNDhjLTAuNjU5LC0wLjg1OSAtMS44NjgsLTIuOTM3IC0xLjk0MSwtMy4xMDljLTEuNjI2LC0zLjgxNyAtMS44NDgsLTUuMTY5IC0yLjA3MSwtNy44NzNjLTAuMjI3LC0yLjc2NSAwLjE4NywtNi4yMTggMC43MDcsLTguNzE3YzAuNDU3LC0yLjE5NiAyLjM3NCwtNi4xOTcgMi40MTMsLTYuMjhjMC4xMiwtMC4yNTQgMy45NDUsLTkuNDQzIDE1LjMwNSwtOS4zNjdjMS41OTgsMC4wMTEgMTIuMzg3LDAuMjE1IDE0LjA1OCwxMy4xMThjMC4yNjYsMi4wNTMgMC4zNTUsNC44NSAtMC4wODcsNi4yMWMtMC4wNTEsMC4xNTcgLTAuNDg4LDEuNSAtMC44NzcsMS44NjZjLTAuMDYxLDAuMDU3IC0wLjE1MSwwLjA3NSAtMC4yMTgsMC4xMjZjLTAuMjU1LDAuMTkzIC0wLjI0OCwwLjI4NSAtMS4yOTksMC4yODljLTYuMjU5LDAuMDI0IC0xMC45MTYsMC4wMiAtMTQuMDksMC4wMmMtMy40MywtMCAtNS4xMjcsMC4wMDUgLTUuMjM5LDAuMDU2Yy0wLjA1MiwwLjAyNCAtMC4wNzQsMC4wODcgLTAuMTE1LDAuMTI3Yy0wLjExMSwwLjEwOSAtMC4yNCwwLjA5NyAtMC4xNjIsMS4yOThjMC4wNTEsMC43OTYgMC45NTksMy4zNjMgMS4wNDIsMy41MDVjMC4xNDYsMC4yNDkgMC44ODUsMS42OTIgMS4yNjYsMi4xOTZjMC4yNzYsMC4zNjQgMC4yOTIsMC4zNDMgMC42MTYsMC42NjlabTQuNTIxLC0xMy42OTdjMC44MzksLTAuMDA1IDEuNzMzLC0wLjAxIDMuNDA1LC0wLjAxNmMxLjU4OSwtMC4wMDUgMi4yMTcsLTAuMjIzIDIuMDYyLC0yLjk2MmMtMC4xNzIsLTMuMDE5IC0xLjkzNCwtNS41NjMgLTQuNTgzLC02LjA1NGMtMC4zMSwtMC4wNTcgLTMuNTYzLC0wLjYwMSAtNi4yMTIsMy4wNDJjLTAuNDc0LDAuNjUxIC0xLjkxMywyLjMyOCAtMi4xMTYsNS4xOWMtMC4wMDQsMC4wNTEgMC4wMiwwLjM2MSAwLjI1NCwwLjU4NWMwLjI4OSwwLjI3NiAwLjk3NywwLjIyNyAzLjQwMSwwLjIyNWMxLjkyOCwtMC4wMDEgMi44MjIsLTAuMDA1IDMuNzg5LC0wLjAxMVoiIHN0eWxlPSJmaWxsOiNmZDdkNTk7Ii8+PHBhdGggZD0iTTE2MS40NzQsNDkuMDU1Yy0wLjU0OSwtMC43MzMgLTEsLTEuNDU4IC0xLjQ2OSwtMS43M2MtMC4yNywtMC4xNTcgLTIuMDcyLC0yLjUwNSAtMi4yMzUsLTMuMzk1Yy0xLjEzNSwtNi4yMTUgNy4zNjIsLTEuNzk2IDEzLjM1OSwwLjU2NWM0LjQ1NywxLjc1NSAzLjY2NCwzLjYwMiAwLjk3Niw3LjM5NmMtNC43ODgsNi43NTkgLTYuNDI2LDkuMDI2IC04LjQ4OSw3LjQ1OWMtMS42MiwtMS4yMyAtMC41NTIsLTQuMTkxIC0wLjU1OCwtNC44NjdjLTAuMDE5LC0yLjIyMyAtMC41MzgsLTQuMDM0IC0xLjU4NCwtNS40MjlaIiBzdHlsZT0iZmlsbDojOTI0ZmFjOyIvPjxwYXRoIGQ9Ik0xNjEuOTAyLDU0LjIyNmMtMC4xNDQsMC40MTggLTAuNTMzLDAuODkxIC0wLjg5MSwxLjEwOWMtNS44MjcsMy41NTYgLTYuMDM1LDUuMjI0IC0xMi43NTEsMTIuMTA2Yy0xMi4zMDIsMTIuNjA2IC0yMy40MzgsMTMuNjUgLTI0LjU3LDEzLjkwOWMtMy4wNzQsMC43MDMgLTguOTA4LDAuMiAtMTAuMzU2LC0wLjIyYy03LjU2NSwtMi4xOTEgLTExLjM1NCwtNS4yNSAtMTQuNTQ2LC0xMS43NWMtMC42ODUsLTEuMzk1IC0xLjU0OCwtNS41ODkgLTEuNTUsLTUuNjA4Yy0wLjgyLC01Ljk3NSAtMC4xMDgsLTguNDY2IC0wLjA4NSwtOC41OTljMC4yOTksLTEuNjkxIC0wLjk4NSwtMC43NjIgLTMuMTk5LDAuNDU4Yy00Ljg1NCwyLjY3MyAtNC40MjYsLTIuNzk4IC0zLjk4LC0zLjc4NWMxLjkzNiwtNC4yNzkgNS4zMzMsLTUuNDQ5IDguMjA2LC03LjA5NGMxLjA3NiwtMC42MTYgMC41OSwtMi43OTMgMy4xMjksLTkuNjMzYzMuMDYyLC04LjI0OCA1LjMxLC0xMS4xMDMgNy4zNiwtMTQuMjcyYzMuMjY5LC01LjA1NCA3Ljk4OSwtMTAuMDk1IDExLjcwMywtMTMuMTAxYzExLjY3OCwtOS40NTEgMjMuMjQ1LC04LjU2NiAyNy41MTgsLTYuMDk1YzguMTg1LDQuNzM0IDUuMDY2LDEzLjk2OCA0LjUzMiwxNS43NjVjLTAuNjMsMS42IC0wLjgyMiwyLjc1NSAtMy4xNzIsNi4zNDZjLTAuNzc5LDEuMTkgLTQuNzQyLDcuMjQ1IC0xMi40MzMsMTIuNzAyYy05LjM0NSw2LjYzMSAtMjAuMzgsMTAuNjI5IC0yMy42NTcsMTEuODk4Yy0xLjQ2LDAuNTY1IC0xLjE2OSwwLjkwNSAtMS4zMDQsMS43MDVjLTAuOTMxLDUuNTQ0IC0wLjY3NSw4LjE5MiAwLjcwNCwxMS45NzhjMi4xODQsNS45OTggMTIuNjI4LDEwLjUyNyAyNS4zNTQsMS43MjJjNi45MTIsLTQuNzgyIDExLjc2NiwtMTEuNTcxIDE5LjU1NCwtMTUuMjM0YzAuMjAxLC0wLjA5NSAwLjg0NSwtMC40MDMgMS40MywtMC4yNzVjMC40OTUsMC4xMDkgMC43ODgsMC4zMSAwLjkyLDAuNDhjMC40MzUsMC41NTkgMC43NTMsMC44ODEgMS4wODEsMS40OThjMC41NDgsMS4wMzMgMC44NjEsMS43NTkgMS4wMzYsMi40MWMwLjE3OSwwLjY2NiAwLjExOSwxLjEzMSAtMC4wMzYsMS41OFptLTQ2LjUzNSwtMTguMjI1Yy0wLjk5NSwyLjczNCAtMS4wNDEsMi44OTUgLTAuOCwyLjkyOWMwLjI2MSwwLjAzNyAxMC4xNjUsLTMuNzg1IDE1LjQwNSwtNy4zODNjMC4yNSwtMC4xNzEgOC4wNDUsLTQuNzE5IDExLjcxMSwtMTIuNTVjMy4yNDMsLTYuOTI4IDAuNjczLC0xMC4yMzYgLTEuNDc5LC0xMC41MjhjLTEzLjE4MiwtMS43ODcgLTIzLjY4OSwyMy4zMjcgLTI0LjgzNywyNy41MzFaIiBzdHlsZT0iZmlsbDojZmQ3ZDU5OyIvPjwvc3ZnPg==" alt="Emerson">
+    <div class="topbar-sep"></div>
+    <div class="topbar-app">podcast editor</div>
+  </div>
+  <div class="topbar-spacer"></div>
+  <button class="btn-topbar" onclick="document.getElementById('jingleModal').classList.add('open')">⚡ Vinheta</button>
+  <div class="topbar-status">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">ocioso</span>
+  </div>
+  <div class="topbar-user" onclick="doLogout()">
+    <div class="user-avatar" id="navAvatar">—</div>
+    <div class="user-name"   id="navName">—</div>
+  </div>
+</div>
+
+<div id="app">
+
+  <div id="hero">
+    <div class="hero-overline">Editor profissional</div>
+    <h1 class="hero-headline">Corte.<br>Edite.<br><span>Publique.</span></h1>
+    <p class="hero-sub">
+      Transcrição com Whisper, análise editorial com IA e exportação
+      profissional — sem limite de tamanho de arquivo.
+    </p>
+
+    <div id="upload-zone">
+      <input type="file" id="fileInput" accept="video/*,audio/*">
+      <div class="wave-viz">
+        <div class="w"></div><div class="w"></div><div class="w"></div>
+        <div class="w"></div><div class="w"></div><div class="w"></div>
+        <div class="w"></div><div class="w"></div><div class="w"></div>
+        <div class="w"></div><div class="w"></div><div class="w"></div>
+        <div class="w"></div>
+      </div>
+      <div class="upload-cta">Arraste o arquivo aqui</div>
+      <div class="upload-hint">MP4 · MOV · MKV · M4A · MP3 &nbsp;·&nbsp; <strong>sem limite de tamanho</strong></div>
     </div>
   </div>
 
-  <!-- ANÁLISE -->
+  <div id="processing-panel">
+    <div class="proc-wrap">
+      <div class="proc-num" id="procNum">01</div>
+      <div class="proc-meta">
+        <div class="proc-stage" id="procStage">Iniciando</div>
+        <div class="proc-title" id="procTitle">Preparando...</div>
+        <div class="proc-msg"   id="procMsg">Aguarde</div>
+      </div>
+    </div>
+    <div class="prog-track">
+      <div class="prog-fill" id="progFill" style="width:0%"></div>
+    </div>
+    <div class="prog-meta-row">
+      <span id="progLabel">—</span>
+      <span id="progPct">0%</span>
+    </div>
+    <div class="steps-list">
+      <div class="step-item" id="step-upload">
+        <div class="step-ico" id="si-upload">01</div>
+        <div class="step-lbl">Upload e validação do arquivo</div>
+      </div>
+      <div class="step-item" id="step-whisper">
+        <div class="step-ico" id="si-whisper">02</div>
+        <div class="step-lbl">Transcrição com Whisper</div>
+      </div>
+      <div class="step-item" id="step-claude">
+        <div class="step-ico" id="si-claude">03</div>
+        <div class="step-lbl">Análise editorial com IA</div>
+      </div>
+    </div>
+  </div>
+
   <div id="analysis-section">
 
-    <!-- META DO EPISÓDIO -->
-    <div class="section-title">📋 Episódio</div>
-    <div class="meta-card" id="metaCard"></div>
-
-    <!-- STATS -->
-    <div class="stats-bar" id="statsBar"></div>
-
-    <!-- MELHOR CLIP -->
-    <div class="section-title">✂️ Melhor Clip para Redes</div>
-    <div class="clip-card" id="clipCard"></div>
-
-    <!-- FRASE DESTAQUE -->
-    <div class="section-title">💬 Frase Destaque</div>
-    <div class="quote-card" id="quoteCard"></div>
-
-    <!-- CAPÍTULOS -->
-    <div class="section-title">📑 Capítulos</div>
-    <div id="chaptersContainer" style="margin-bottom:24px"></div>
-
-    <!-- PROBLEMAS -->
-    <div class="section-title" id="probTitle" style="display:none">⚠️ Problemas Detectados</div>
-    <div id="problemsContainer" style="margin-bottom:24px"></div>
-
-    <!-- CORTES -->
-    <div class="cuts-header">
-      <div class="section-title" style="margin:0">🔪 Cortes Sugeridos</div>
-      <div class="cuts-actions">
-        <button class="btn-sm" onclick="selectAll(true)">Aprovar todos</button>
-        <button class="btn-sm" onclick="selectAll(false)">Remover todos</button>
+    <div class="sec-div"><div class="sec-n">01</div><div class="sec-lbl">Episódio</div><div class="sec-line"></div></div>
+    <div class="ep-grid">
+      <div class="ep-main">
+        <div class="ep-eyebrow">Título sugerido</div>
+        <div class="ep-title" id="epTitle">—</div>
+        <div class="ep-alts" id="epAlts"></div>
+        <div class="ep-summary" id="epSummary"></div>
+      </div>
+      <div class="stats-panel">
+        <div class="stats-head">Métricas</div>
+        <div class="stat-row"><div class="stat-val" id="stBruto">—</div><div class="stat-lbl">Duração bruta</div></div>
+        <div class="stat-row"><div class="stat-val" id="stEdit">—</div><div class="stat-lbl">Duração editada</div></div>
+        <div class="stat-row"><div class="stat-val" id="stPPM">—</div><div class="stat-lbl">Palavras / min</div></div>
+        <div class="stat-row"><div class="stat-val" id="stPausa">—</div><div class="stat-lbl">Pausas longas</div></div>
       </div>
     </div>
-    <div id="cutsContainer"></div>
 
-    <!-- TRANSCRIÇÃO -->
-    <div id="transcript-section">
-      <div class="section-title">📝 Transcrição Completa</div>
-      <div class="transcript-box" id="transcriptBox"></div>
-    </div>
-
-    <!-- EXPORTAR -->
-    <div class="export-card">
-      <div class="section-title" style="margin-bottom:16px">🚀 Exportar</div>
-      <div class="export-options">
-        <label class="checkbox-label">
-          <input type="checkbox" id="makeClip" checked>
-          Gerar clip de 60–90s para redes sociais
-        </label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="makeTranscript" checked>
-          Exportar transcrição em texto
-        </label>
+    <div class="sec-div"><div class="sec-n">02</div><div class="sec-lbl">Destaques</div><div class="sec-line"></div></div>
+    <div class="hl-grid">
+      <div class="hl-card">
+        <div class="hl-eye">Melhor clip para redes</div>
+        <div class="hl-time" id="hlClipTime">—</div>
+        <div class="hl-desc" id="hlClipDesc">—</div>
       </div>
-      <button class="btn-export" id="exportBtn" onclick="exportJob()">
-        Executar cortes e exportar →
-      </button>
+      <div class="hl-card">
+        <div class="hl-eye">Frase destaque</div>
+        <div class="hl-quote" id="hlQuote">—</div>
+        <div class="hl-desc"  id="hlQuoteTs">—</div>
+      </div>
     </div>
+
+    <div class="sec-div"><div class="sec-n">03</div><div class="sec-lbl">Capítulos</div><div class="sec-line"></div></div>
+    <div class="chaps-grid" id="chapsGrid"></div>
+
+    <div id="probSec" style="display:none">
+      <div class="sec-div"><div class="sec-n">04</div><div class="sec-lbl">Problemas detectados</div><div class="sec-line"></div></div>
+      <div id="probList"></div>
+    </div>
+
+    <div class="sec-div"><div class="sec-n" id="cutsSN">05</div><div class="sec-lbl">Cortes sugeridos</div><div class="sec-line"></div></div>
+    <div class="cuts-bar">
+      <div class="cuts-info"><strong id="cutsTotal">0</strong> segmentos · <strong id="cutsSel">0</strong> selecionados</div>
+      <div class="cuts-btns">
+        <button class="btn-sm" onclick="selectAll(true)">Selecionar todos</button>
+        <button class="btn-sm" onclick="selectAll(false)">Limpar</button>
+      </div>
+    </div>
+    <div id="cutsTable"></div>
+
+    <div class="sec-div" id="txDiv" style="display:none"><div class="sec-n">06</div><div class="sec-lbl">Transcrição</div><div class="sec-line"></div></div>
+    <div class="tx-wrap" id="txWrap" style="display:none">
+      <div class="tx-inner" id="txBox"></div>
+    </div>
+
+    <div class="sec-div"><div class="sec-n">—</div><div class="sec-lbl">Exportar</div><div class="sec-line"></div></div>
+    <div class="export-panel">
+      <div class="exp-opts">
+        <label class="opt-lbl"><input type="checkbox" id="makeClip" checked> Gerar clip 60–90s</label>
+        <label class="opt-lbl"><input type="checkbox" id="makeTx"   checked> Exportar transcrição</label>
+      </div>
+      <button class="btn-export" id="exportBtn" onclick="exportJob()">Executar cortes e exportar →</button>
+    </div>
+
   </div>
 
-  <!-- DOWNLOADS -->
   <div id="downloads-section">
-    <div class="section-title">✅ Pronto para download</div>
-    <div class="downloads-grid" id="downloadsGrid"></div>
+    <div class="sec-div"><div class="sec-n">✓</div><div class="sec-lbl">Pronto para download</div><div class="sec-line"></div></div>
+    <div class="dl-grid" id="dlGrid"></div>
   </div>
 
-</main>
+</div>
+</div><!-- /main-app -->
 
 <!-- JINGLE MODAL -->
-<div class="modal" id="jingleModal">
+<div class="modal-ov" id="jingleModal">
   <div class="modal-box">
-    <button class="modal-close" onclick="document.getElementById('jingleModal').classList.remove('open')">×</button>
-    <div class="modal-title">Configurar Vinheta</div>
-    <div class="modal-sub">A vinheta é adicionada automaticamente em todos os episódios.</div>
-    <div class="upload-field">
-      <label>Vinheta de Abertura</label>
-      <input type="file" id="jingleOpenFile" accept="video/*,audio/*">
+    <div class="modal-hd">
+      <div>
+        <div class="modal-title">Configurar Vinheta</div>
+        <div class="modal-sub">Adicionada automaticamente em todos os episódios</div>
+      </div>
+      <button class="modal-close" onclick="document.getElementById('jingleModal').classList.remove('open')">×</button>
     </div>
-    <div class="upload-field">
-      <label>Vinheta de Fechamento</label>
-      <input type="file" id="jingleCloseFile" accept="video/*,audio/*">
+    <div class="modal-bd">
+      <div class="f-field">
+        <label class="f-label">Abertura</label>
+        <div class="f-row" onclick="document.getElementById('jOpen').click()">
+          <input type="file" id="jOpen" accept="video/*,audio/*" onchange="setFn(this,'fno')">
+          <span class="f-name" id="fno">Nenhum arquivo</span>
+          <span class="f-browse">Selecionar</span>
+        </div>
+      </div>
+      <div class="f-field">
+        <label class="f-label">Fechamento</label>
+        <div class="f-row" onclick="document.getElementById('jClose').click()">
+          <input type="file" id="jClose" accept="video/*,audio/*" onchange="setFn(this,'fnc')">
+          <span class="f-name" id="fnc">Nenhum arquivo</span>
+          <span class="f-browse">Selecionar</span>
+        </div>
+      </div>
+      <button class="btn-save" onclick="saveJingles()">Salvar vinhetas</button>
     </div>
-    <button class="btn-save" onclick="saveJingles()">Salvar vinhetas</button>
   </div>
 </div>
 
 <script>
-let currentJobId = null;
-let pollInterval = null;
-let cutsData = [];
+/* ══ AUTH ════════════════════════════════════════════════════ */
+const USERS = {
+  'admin':   { pass: 'emerson2026', role: 'admin',  name: 'Admin' },
+  'editor1': { pass: 'editor123',   role: 'editor', name: 'Editor' },
+};
 
-// ─── FORMAT ──────────────────────────────────────────────────────────────
-function fmt(s) {
-  const m = Math.floor(s/60), sec = Math.floor(s%60);
-  return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+let currentUser = null;
+let pendingUser = null;
+
+function doLogin() {
+  const u = document.getElementById('loginUser').value.trim();
+  const p = document.getElementById('loginPass').value;
+  const errEl = document.getElementById('loginError');
+  errEl.textContent = '';
+
+  if (!u || !p) { errEl.textContent = 'Preencha usuário e senha.'; return; }
+
+  const user = USERS[u];
+  if (!user || user.pass !== p) {
+    errEl.textContent = 'Usuário ou senha inválidos.';
+    return;
+  }
+
+  currentUser = { username: u, ...user };
+
+  if (user.role === 'admin') {
+    enterApp();
+  } else {
+    // Editor: precisa de aprovação do admin
+    showApprovalWait();
+  }
 }
 
-// ─── UPLOAD ──────────────────────────────────────────────────────────────
-const fileInput = document.getElementById('fileInput');
-const uploadZone = document.getElementById('uploadZone');
-
-fileInput.addEventListener('change', e => { if (e.target.files[0]) startUpload(e.target.files[0]); });
-
-uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag'); });
-uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag'));
-uploadZone.addEventListener('drop', e => {
-  e.preventDefault(); uploadZone.classList.remove('drag');
-  const f = e.dataTransfer.files[0]; if (f) startUpload(f);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    if (document.getElementById('login-screen').style.display !== 'none') doLogin();
+  }
 });
 
-async function startUpload(file) {
-  uploadZone.style.display = 'none';
-  document.getElementById('progress-section').style.display = 'block';
-  updateProgress(5, 'Enviando arquivo...', `${file.name}`);
+function showApprovalWait() {
+  document.getElementById('login-screen').style.display = 'none';
+  const sc = document.getElementById('approval-screen');
+  sc.style.display = 'flex';
 
-  const fd = new FormData();
-  fd.append('file', file);
-  const res = await fetch('/upload', { method:'POST', body: fd });
-  const data = await res.json();
-  currentJobId = data.job_id;
-  pollInterval = setInterval(pollStatus, 2000);
+  // Preenche badge do usuário aguardando
+  const initials = currentUser.name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+  document.getElementById('approvalAvatar').textContent = initials;
+  document.getElementById('approvalName').textContent   = currentUser.name;
+  document.getElementById('approvalRole').textContent   = 'Editor · aguardando aprovação';
+
+  // Simula: admin vê os botões de aprovação/negação
+  // Em produção real, isso seria uma rota separada para o admin
+  // Aqui: se clicar na tela de aprovação com Ctrl+A, aparece painel admin
+  pendingUser = currentUser;
+
+  document.addEventListener('keydown', adminShortcut);
 }
 
-// ─── POLL ─────────────────────────────────────────────────────────────────
-async function pollStatus() {
-  if (!currentJobId) return;
-  const res = await fetch(`/status/${currentJobId}`);
+function adminShortcut(e) {
+  if (e.ctrlKey && e.key === 'a') {
+    e.preventDefault();
+    // Mostra controles de admin (simula admin ver a tela)
+    document.getElementById('approvalActions').style.display = 'grid';
+    document.getElementById('approvalPending').style.display = 'none';
+  }
+}
+
+function approveAccess() {
+  document.removeEventListener('keydown', adminShortcut);
+  document.getElementById('approval-screen').style.display = 'none';
+  enterApp();
+}
+
+function denyAccess() {
+  document.removeEventListener('keydown', adminShortcut);
+  currentUser = null; pendingUser = null;
+  document.getElementById('approval-screen').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('loginError').textContent = 'Acesso negado pelo administrador.';
+  document.getElementById('loginUser').value = '';
+  document.getElementById('loginPass').value = '';
+}
+
+function enterApp() {
+  document.getElementById('login-screen').style.display    = 'none';
+  document.getElementById('approval-screen').style.display = 'none';
+  document.getElementById('main-app').style.display        = 'block';
+
+  const initials = currentUser.name.split(' ').map(w=>w[0]).join('').toUpperCase().slice(0,2);
+  document.getElementById('navAvatar').textContent = initials;
+  document.getElementById('navName').textContent   = currentUser.name;
+}
+
+function doLogout() {
+  if (!confirm('Sair do sistema?')) return;
+  currentUser = null;
+  document.getElementById('main-app').style.display     = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('loginUser').value = '';
+  document.getElementById('loginPass').value = '';
+  document.getElementById('loginError').textContent = '';
+  // Reset app state
+  location.reload();
+}
+
+/* ══ APP ═════════════════════════════════════════════════════ */
+let jobId = null, poll = null, cuts = [];
+
+function fmt(s) {
+  s = s||0;
+  return `${String(Math.floor(s/60)).padStart(2,'0')}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+}
+
+function setStatus(t, live=false) {
+  document.getElementById('statusText').textContent = t;
+  document.getElementById('statusDot').className = 'status-dot'+(live?' live':'');
+}
+
+const fileInput  = document.getElementById('fileInput');
+const uploadZone = document.getElementById('upload-zone');
+
+fileInput.addEventListener('change', e => { if(e.target.files[0]) upload(e.target.files[0]) });
+uploadZone.addEventListener('dragover',  e => { e.preventDefault(); uploadZone.classList.add('drag') });
+uploadZone.addEventListener('dragleave', ()  => uploadZone.classList.remove('drag'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault(); uploadZone.classList.remove('drag');
+  const f = e.dataTransfer.files[0]; if(f) upload(f);
+});
+
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB por chunk
+
+async function upload(file) {
+  document.getElementById('hero').style.display = 'none';
+  document.getElementById('processing-panel').style.display = 'block';
+  setStatus('carregando…', true);
+  setStep('upload','active');
+  setProcState('01','Upload',`Enviando ${file.name}…`,`${(file.size/1024/1024).toFixed(1)} MB`);
+  setProgress(2,'Iniciando envio');
+
+  // 1. Criar job_id no servidor
+  const initRes = await fetch('/upload-init', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({filename: file.name})
+  });
+  const {job_id} = await initRes.json();
+  jobId = job_id;
+
+  // 2. Dividir arquivo em chunks de 5MB e enviar
+  const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+  for (let i = 0; i < totalChunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end   = Math.min(start + CHUNK_SIZE, file.size);
+    const chunk = file.slice(start, end);
+
+    const fd = new FormData();
+    fd.append('job_id',       job_id);
+    fd.append('chunk_index',  i);
+    fd.append('total_chunks', totalChunks);
+    fd.append('filename',     file.name);
+    fd.append('chunk',        chunk, file.name);
+
+    await fetch('/upload-chunk', {method:'POST', body: fd});
+
+    // Progresso: 2% → 8% durante upload
+    const pct = Math.round(2 + ((i + 1) / totalChunks) * 6);
+    setProgress(pct, `Enviando… ${i+1}/${totalChunks} partes`);
+  }
+
+  setStep('upload','done');
+  setProgress(8, 'Upload concluído — processando…');
+  poll = setInterval(doPoll, 2000);
+}
+
+function setStep(id, state) {
+  const item = document.getElementById(`step-${id}`);
+  const ico  = document.getElementById(`si-${id}`);
+  if(!item||!ico) return;
+  item.className = 'step-item'+(state==='active'?' active':state==='done'?' done':'');
+  ico.className  = 'step-ico'+(state==='active'?' spinning':state==='done'?' ok':'');
+  if(state==='done') ico.textContent = '✓';
+}
+
+function setProcState(num, stage, title, msg) {
+  document.getElementById('procNum').textContent   = num;
+  document.getElementById('procNum').className     = 'proc-num lit';
+  document.getElementById('procStage').textContent = stage;
+  document.getElementById('procTitle').textContent = title;
+  document.getElementById('procMsg').textContent   = msg;
+}
+
+function setProgress(pct, lbl) {
+  document.getElementById('progFill').style.width  = pct+'%';
+  document.getElementById('progPct').textContent   = pct+'%';
+  document.getElementById('progLabel').textContent = lbl||'—';
+}
+
+async function doPoll() {
+  if(!jobId) return;
+  const res = await fetch(`/status/${jobId}`);
   const job = await res.json();
+  setProgress(job.progress||0, job.msg);
 
-  updateProgress(job.progress || 0, job.msg || '...', '');
+  if(job.progress>=10 && job.progress<60) {
+    setStep('whisper','active');
+    setProcState('02','Transcrição','Whisper processando o áudio…','Pode levar alguns minutos');
+    setStatus('transcrevendo',true);
+  } else if(job.progress>=60) {
+    setStep('whisper','done');
+    setStep('claude','active');
+    setProcState('03','Análise IA','Claude analisando o conteúdo…','Identificando cortes e destaques');
+    setStatus('analisando',true);
+  }
 
-  if (job.status === 'ready') {
-    clearInterval(pollInterval);
-    document.getElementById('progSpinner').classList.add('done');
+  if(job.status==='ready') {
+    clearInterval(poll);
+    setStep('claude','done');
+    setStatus('pronto');
     showAnalysis(job);
-  } else if (job.status === 'done') {
-    clearInterval(pollInterval);
-    document.getElementById('progSpinner').classList.add('done');
+  } else if(job.status==='done') {
+    clearInterval(poll);
+    setStatus('exportado');
     showDownloads(job);
-  } else if (job.status === 'error') {
-    clearInterval(pollInterval);
-    document.getElementById('progTitle').textContent = '❌ Erro';
-    document.getElementById('progMsg').textContent = job.msg;
+  } else if(job.status==='error') {
+    clearInterval(poll);
+    setStatus('erro');
+    setProcState('!!','Erro',job.msg||'Erro inesperado','Tente novamente');
   }
 }
 
-function updateProgress(pct, title, msg) {
-  document.getElementById('progTitle').textContent = title;
-  document.getElementById('progMsg').textContent = msg;
-  document.getElementById('progBar').style.width = pct + '%';
-  document.getElementById('progPct').textContent = pct + '%';
-}
-
-// ─── ANALYSIS ────────────────────────────────────────────────────────────
 function showAnalysis(job) {
-  const a = job.analysis;
-  if (!a) return;
-
+  document.getElementById('processing-panel').style.display = 'none';
   document.getElementById('analysis-section').style.display = 'block';
+  const a=job.analysis||{}, ep=a.episodio||{}, st=a.estatisticas||{};
 
-  // Meta
-  const ep = a.episodio || {};
-  document.getElementById('metaCard').innerHTML = `
-    <div class="meta-title-big">${ep.titulo_sugerido || 'Sem título'}</div>
-    <div class="meta-alts">
-      ${(ep.titulos_alternativos||[]).map(t=>`<div class="meta-alt">${t}</div>`).join('')}
-    </div>
-    <div class="meta-body">${ep.resumo || ''}</div>
-    ${ep.descricao_plataformas ? `<div class="meta-desc">${ep.descricao_plataformas}</div>` : ''}
-  `;
+  document.getElementById('epTitle').textContent   = ep.titulo_sugerido||'Sem título';
+  document.getElementById('epSummary').textContent = ep.resumo||'';
+  document.getElementById('epAlts').innerHTML = (ep.titulos_alternativos||[]).map(t=>
+    `<div class="ep-alt" onclick="document.getElementById('epTitle').textContent=this.textContent">${t}</div>`
+  ).join('');
 
-  // Stats
-  const st = a.estatisticas || {};
-  const dur_min = Math.floor((job.duration||0)/60);
-  const rec_min = Math.floor((st.recomendacao_duracao_final||0)/60);
-  document.getElementById('statsBar').innerHTML = `
-    <div class="stat"><div class="stat-val">${dur_min}min</div><div class="stat-lbl">Duração bruta</div></div>
-    <div class="stat"><div class="stat-val red">${rec_min}min</div><div class="stat-lbl">Duração editada</div></div>
-    <div class="stat"><div class="stat-val">${st.palavras_por_minuto||'—'}</div><div class="stat-lbl">Palavras/min</div></div>
-    <div class="stat"><div class="stat-val">${st.pausas_longas||0}</div><div class="stat-lbl">Pausas longas</div></div>
-    <div class="stat"><div class="stat-val">${(a.cortes||[]).filter(c=>c.tipo==='manter').length}</div><div class="stat-lbl">Segmentos mantidos</div></div>
-    <div class="stat"><div class="stat-val red">${(a.cortes||[]).filter(c=>c.tipo==='cortar').length}</div><div class="stat-lbl">Segmentos cortados</div></div>
-  `;
+  document.getElementById('stBruto').textContent  = Math.round((job.duration||0)/60)+'min';
+  document.getElementById('stEdit').textContent   = Math.round((st.recomendacao_duracao_final||0)/60)+'min';
+  document.getElementById('stPPM').textContent    = st.palavras_por_minuto||'—';
+  document.getElementById('stPausa').textContent  = st.pausas_longas||'0';
 
-  // Clip
-  const mc = a.melhor_clip || {};
-  document.getElementById('clipCard').innerHTML = `
-    <div class="clip-icon">🎬</div>
-    <div class="clip-info">
-      <div class="clip-title">Clip recomendado para redes sociais</div>
-      <div class="clip-sub">${mc.motivo || ''}</div>
-    </div>
-    <div class="clip-ts">${fmt(mc.inicio||0)} → ${fmt(mc.fim||0)} · ${Math.round(mc.duracao||0)}s</div>
-  `;
+  const mc=a.melhor_clip||{};
+  document.getElementById('hlClipTime').textContent = mc.inicio!=null?`${fmt(mc.inicio)} → ${fmt(mc.fim)}`:'—';
+  document.getElementById('hlClipDesc').textContent = mc.motivo||'';
 
-  // Quote
-  const fq = a.frase_destaque || {};
-  document.getElementById('quoteCard').innerHTML = fq.texto ? `
-    <div class="quote-text">"${fq.texto}"</div>
-    <div class="quote-ts">${fmt(fq.inicio||0)} → ${fmt(fq.fim||0)}</div>
-  ` : '<div class="quote-text" style="color:#444">Nenhuma frase destaque detectada</div>';
+  const fq=a.frase_destaque||{};
+  document.getElementById('hlQuote').textContent  = fq.texto||'—';
+  document.getElementById('hlQuoteTs').textContent= fq.inicio!=null?`${fmt(fq.inicio)} → ${fmt(fq.fim)}`:'';
 
-  // Capítulos
-  const caps = a.capitulos || [];
-  document.getElementById('chaptersContainer').innerHTML = caps.map(c=>`
-    <div class="chapter-item">
-      <div class="chap-ts">${fmt(c.inicio||0)}</div>
+  document.getElementById('chapsGrid').innerHTML = (a.capitulos||[]).map(c=>`
+    <div class="chap-card">
+      <div class="chap-ts">${fmt(c.inicio)}</div>
       <div class="chap-title">${c.titulo}</div>
-    </div>
-  `).join('');
+    </div>`).join('');
 
-  // Problemas
-  const probs = a.problemas_detectados || [];
-  if (probs.length > 0) {
-    document.getElementById('probTitle').style.display = 'block';
-    const icons = { silencio_longo:'🔇', vicio_linguagem:'🗣', audio_ruim:'📢', repeticao:'🔄' };
-    document.getElementById('problemsContainer').innerHTML = probs.map(p=>`
-      <div class="problem-item">
-        <div class="prob-icon">${icons[p.tipo]||'⚠️'}</div>
-        <div class="prob-text">${p.descricao}</div>
-        <div class="prob-ts">${fmt(p.inicio||0)}</div>
-      </div>
-    `).join('');
+  const probs=a.problemas_detectados||[];
+  if(probs.length) {
+    document.getElementById('probSec').style.display='block';
+    document.getElementById('cutsSN').textContent='05';
+    const lbl={silencio_longo:'Silêncio longo',vicio_linguagem:'Vício de linguagem',audio_ruim:'Áudio ruim',repeticao:'Repetição'};
+    document.getElementById('probList').innerHTML = probs.map(p=>`
+      <div class="prob-row">
+        <div class="prob-type">${lbl[p.tipo]||p.tipo}</div>
+        <div class="prob-desc">${p.descricao}</div>
+        <div class="prob-at">${fmt(p.inicio)}</div>
+      </div>`).join('');
+  } else {
+    document.getElementById('cutsSN').textContent='04';
   }
 
-  // Cortes
-  cutsData = (a.cortes||[]).map(c=>({...c, approved: c.tipo==='manter'}));
+  cuts=(a.cortes||[]).map(c=>({...c,sel:c.tipo!=='cortar'}));
   renderCuts();
 
-  // Transcrição
-  if (job.transcript) {
-    document.getElementById('transcript-section').style.display = 'block';
-    document.getElementById('transcriptBox').textContent = job.transcript;
+  if(job.transcript) {
+    document.getElementById('txDiv').style.display='flex';
+    document.getElementById('txWrap').style.display='block';
+    document.getElementById('txBox').textContent=job.transcript;
   }
 }
 
 function renderCuts() {
-  document.getElementById('cutsContainer').innerHTML = cutsData.map((c,i)=>`
-    <div class="cut-item ${c.approved?'approved':''} ${!c.approved&&c.tipo==='manter'?'removed':''}" id="cut-${i}">
-      <div class="cut-indicator ${c.tipo}"></div>
+  const sel=cuts.filter(c=>c.sel).length;
+  document.getElementById('cutsTotal').textContent=cuts.length;
+  document.getElementById('cutsSel').textContent=sel;
+
+  document.getElementById('cutsTable').innerHTML=cuts.map((c,i)=>{
+    const dur=Math.round(c.duracao||(c.fim-c.inicio));
+    const prio=c.prioridade||2;
+    return `<div class="cut-row${c.sel?'':' removed'}" id="cr-${i}">
+      <div class="cut-bar ${c.sel?c.tipo:'removed'}"></div>
+      <div class="cut-tc">
+        <div class="tc-r">${fmt(c.inicio)} → ${fmt(c.fim)}</div>
+        <div class="tc-d">${dur}s</div>
+      </div>
       <div class="cut-body">
-        <div class="cut-top">
-          <span class="cut-type ${c.tipo}">${c.tipo}</span>
-          <span class="cut-ts">${fmt(c.inicio)} → ${fmt(c.fim)}</span>
-          <span class="cut-dur">${Math.round(c.duracao||c.fim-c.inicio)}s</span>
-          <span class="cut-energia ${c.energia||'media'}">${c.energia||'media'}</span>
+        <div class="cut-tags">
+          <span class="ctag ${c.tipo}">${c.tipo}</span>
+          <span class="ctag ${c.energia||'media'}">${c.energia||'media'}</span>
         </div>
-        <div class="cut-just">${c.justificativa||''}</div>
+        <div class="cut-reason">${c.justificativa||''}</div>
       </div>
-      <div class="cut-actions">
-        <button class="cut-toggle ${c.approved?'active':''}" onclick="toggleCut(${i})" title="${c.approved?'Remover':'Incluir'}">
-          ${c.approved?'✓':'×'}
-        </button>
+      <div class="cut-prio"><div class="pip p${prio}"></div></div>
+      <div class="cut-save"><div class="save-v">−${dur}s</div><div class="save-l">economia</div></div>
+      <div class="cut-tog-cell">
+        <button class="cut-toggle${c.sel?' on':''}" onclick="toggleCut(${i})">${c.sel?'✓':'−'}</button>
       </div>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
 }
 
-function toggleCut(i) {
-  cutsData[i].approved = !cutsData[i].approved;
-  renderCuts();
-}
+function toggleCut(i)    { cuts[i].sel=!cuts[i].sel; renderCuts() }
+function selectAll(val)  { cuts=cuts.map(c=>({...c,sel:val})); renderCuts() }
 
-function selectAll(val) {
-  cutsData = cutsData.map(c=>({...c, approved: val}));
-  renderCuts();
-}
-
-// ─── EXPORT ───────────────────────────────────────────────────────────────
 async function exportJob() {
-  const approved = cutsData.filter(c=>c.approved);
-  if (approved.length === 0) { alert('Selecione pelo menos um segmento para manter.'); return; }
-
-  document.getElementById('exportBtn').disabled = true;
-  document.getElementById('exportBtn').textContent = 'Exportando...';
-  document.getElementById('analysis-section').style.display = 'none';
-  document.getElementById('progress-section').style.display = 'block';
-  updateProgress(72, 'Executando cortes...', 'FFmpeg processando os segmentos aprovados');
-
-  await fetch(`/approve/${currentJobId}`, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({
-      cuts: approved,
-      make_clip: document.getElementById('makeClip').checked
-    })
-  });
-
-  pollInterval = setInterval(async ()=>{
-    const res = await fetch(`/status/${currentJobId}`);
-    const job = await res.json();
-    updateProgress(job.progress||72, job.msg||'...', '');
-    if (job.status==='done') {
-      clearInterval(pollInterval);
-      showDownloads(job);
-    } else if (job.status==='error') {
-      clearInterval(pollInterval);
-      document.getElementById('progTitle').textContent = '❌ Erro';
-      document.getElementById('progMsg').textContent = job.msg;
-    }
-  }, 2000);
+  const approved=cuts.filter(c=>c.sel);
+  if(!approved.length){alert('Selecione pelo menos um segmento.');return}
+  const btn=document.getElementById('exportBtn');
+  btn.disabled=true; btn.textContent='Exportando…';
+  document.getElementById('analysis-section').style.display='none';
+  document.getElementById('processing-panel').style.display='block';
+  setProcState('04','Export','FFmpeg executando os cortes…','Montando episódio final');
+  setProgress(72,'Processando segmentos');
+  setStatus('exportando',true);
+  await fetch(`/approve/${jobId}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cuts:approved,make_clip:document.getElementById('makeClip').checked})});
+  poll=setInterval(async()=>{
+    const r=await fetch(`/status/${jobId}`); const j=await r.json();
+    setProgress(j.progress||72,j.msg||'…');
+    if(j.status==='done'){clearInterval(poll);showDownloads(j)}
+    else if(j.status==='error'){clearInterval(poll);setStatus('erro');setProcState('!!','Erro',j.msg,'Tente novamente')}
+  },2000);
 }
 
-// ─── DOWNLOADS ────────────────────────────────────────────────────────────
 function showDownloads(job) {
-  document.getElementById('progress-section').style.display = 'none';
-  document.getElementById('downloads-section').style.display = 'block';
-
-  const items = [
-    { type:'video', icon:'🎬', title:'Podcast Editado', sub:'Vídeo final com vinheta', avail: !!job.output_video },
-    { type:'clip',  icon:'📱', title:'Clip para Redes', sub:'60–90s do melhor momento', avail: !!job.output_clip },
-    { type:'transcript', icon:'📝', title:'Transcrição', sub:'Texto completo do episódio', avail: !!job.output_transcript },
+  document.getElementById('processing-panel').style.display='none';
+  document.getElementById('downloads-section').style.display='block';
+  setStatus('pronto');
+  const items=[
+    {type:'video',      n:'01',icon:'🎬',title:'Podcast Editado',  sub:'Vídeo final com vinheta',   avail:!!job.output_video},
+    {type:'clip',       n:'02',icon:'📱',title:'Clip para Redes',  sub:'60–90s do melhor momento',  avail:!!job.output_clip},
+    {type:'transcript', n:'03',icon:'📝',title:'Transcrição',      sub:'Texto completo do episódio',avail:!!job.output_transcript},
   ];
-
-  document.getElementById('downloadsGrid').innerHTML = items.filter(i=>i.avail).map(i=>`
+  document.getElementById('dlGrid').innerHTML=items.filter(i=>i.avail).map(i=>`
     <div class="dl-card">
-      <div class="dl-icon">${i.icon}</div>
+      <div class="dl-n">${i.n}</div>
+      <div class="dl-ico">${i.icon}</div>
       <div class="dl-title">${i.title}</div>
       <div class="dl-sub">${i.sub}</div>
-      <a class="btn-dl" href="/download/${currentJobId}/${i.type}" download>⬇ Baixar</a>
-    </div>
-  `).join('');
+      <a class="btn-dl" href="/download/${jobId}/${i.type}" download>⬇ Baixar</a>
+    </div>`).join('');
 }
 
-// ─── JINGLES ──────────────────────────────────────────────────────────────
-async function saveJingles() {
-  const openFile  = document.getElementById('jingleOpenFile').files[0];
-  const closeFile = document.getElementById('jingleCloseFile').files[0];
-  const uploads = [];
-  if (openFile)  uploads.push(uploadJingle('open',  openFile));
-  if (closeFile) uploads.push(uploadJingle('close', closeFile));
-  await Promise.all(uploads);
+function setFn(input,id){document.getElementById(id).textContent=input.files[0]?input.files[0].name:'Nenhum arquivo'}
+async function saveJingles(){
+  const o=document.getElementById('jOpen').files[0];
+  const c=document.getElementById('jClose').files[0];
+  const ups=[];
+  if(o){const fd=new FormData();fd.append('type','open');fd.append('file',o);ups.push(fetch('/upload-jingle',{method:'POST',body:fd}))}
+  if(c){const fd=new FormData();fd.append('type','close');fd.append('file',c);ups.push(fetch('/upload-jingle',{method:'POST',body:fd}))}
+  await Promise.all(ups);
   document.getElementById('jingleModal').classList.remove('open');
-  alert('Vinhetas salvas com sucesso!');
 }
 
-async function uploadJingle(type, file) {
-  const fd = new FormData();
-  fd.append('type', type);
-  fd.append('file', file);
-  await fetch('/upload-jingle', { method:'POST', body: fd });
-}
+document.getElementById('jingleModal').addEventListener('click',e=>{
+  if(e.target===document.getElementById('jingleModal')) document.getElementById('jingleModal').classList.remove('open');
+});
 </script>
 </body>
 </html>"""
