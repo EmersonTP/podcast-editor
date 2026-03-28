@@ -67,27 +67,28 @@ def ts_human(seconds):
 # ─── PIPELINE ─────────────────────────────────────────────────────────────────
 
 def run_whisper(video_path: Path, job_id: str):
-    """Transcreve com Whisper e salva resultado"""
+    """Transcreve com faster-whisper e salva resultado"""
     _update(job_id, status="transcribing", progress=10, msg="Transcrevendo com Whisper...")
     try:
-        import whisper
-        model = whisper.load_model(WHISPER_MODEL)
-        result = model.transcribe(
+        from faster_whisper import WhisperModel
+        model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+        raw_segments, _ = model.transcribe(
             str(video_path),
             language="pt",
             word_timestamps=True,
-            verbose=False
         )
         # Montar segmentos com timestamps
         segments = []
-        for seg in result["segments"]:
+        texts = []
+        for i, seg in enumerate(raw_segments):
             segments.append({
-                "id":    seg["id"],
-                "start": seg["start"],
-                "end":   seg["end"],
-                "text":  seg["text"].strip(),
+                "id":    i,
+                "start": seg.start,
+                "end":   seg.end,
+                "text":  seg.text.strip(),
             })
-        full_text = result["text"].strip()
+            texts.append(seg.text.strip())
+        full_text = " ".join(texts)
         _update(job_id,
             status="analyzing",
             progress=40,
