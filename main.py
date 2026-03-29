@@ -82,6 +82,24 @@ def generate_srt(segments):
         lines.append("")
     return "\n".join(lines)
 
+def generate_srt_clip(segments, clip_start, clip_end):
+    """Gera SRT apenas para o trecho do clip, com timestamps relativos ao início do clip"""
+    lines = []
+    idx = 1
+    for seg in segments:
+        # só segmentos que estão dentro do clip
+        if seg['end'] <= clip_start or seg['start'] >= clip_end:
+            continue
+        # ajusta timestamps para serem relativos ao início do clip
+        start = max(seg['start'] - clip_start, 0)
+        end   = min(seg['end']   - clip_start, clip_end - clip_start)
+        lines.append(str(idx))
+        lines.append(f"{ts_srt(start)} --> {ts_srt(end)}")
+        lines.append(seg['text'])
+        lines.append("")
+        idx += 1
+    return "\n".join(lines)
+
 # ─── PIPELINE ─────────────────────────────────────────────────────────────────
 
 def run_whisper(video_path: Path, job_id: str):
@@ -296,21 +314,69 @@ def run_export(job_id: str, approved_cuts, video_path: Path, make_clip: bool):
 
         _update(job_id, progress=90, msg="Vídeo principal pronto. Gerando clip...")
 
-        # ── 5. Gerar clip para redes sociais ──────────────────────────────
+        # ── 5. Gerar clip horizontal + reel vertical ──────────────────────
         clip_path = None
+        reel_path = None
         job_data = _job(job_id)
         if make_clip and job_data and "analysis" in job_data:
             mc = job_data["analysis"].get("melhor_clip", {})
-            if mc.get("inicio") is not None and mc.get("fim") is not None:
+            clip_start = mc.get("inicio")
+            clip_end   = mc.get("fim")
+            if clip_start is not None and clip_end is not None:
+
+                # 5a. Clip horizontal (16:9)
                 clip_path = out_base / "clip_redes.mp4"
                 subprocess.run([
                     "ffmpeg", "-y",
-                    "-ss", str(mc["inicio"]),
-                    "-to", str(mc["fim"]),
+                    "-ss", str(clip_start), "-to", str(clip_end),
                     "-i", str(video_path),
                     "-c:v", "libx264", "-c:a", "aac",
                     str(clip_path)
                 ], capture_output=True, check=True)
+
+                # 5b. Reel vertical 9:16 com fundo desfocado + legenda queimada
+                _update(job_id, progress=94, msg="Gerando reel vertical 9:16...")
+                clip_srt_path = out_base / "clip_legenda.srt"
+                segs = job_data.get("segments", [])
+                clip_srt_path.write_text(generate_srt_clip(segs, clip_start, clip_end))
+
+                reel_nosub = out_base / "reel_nosub.mp4"
+                # fundo: escala para cobrir 1080x1920 e desfoca; frente: escala proporcional centralizada
+                vf_vertical = (
+                    "[0:v]split=2[bg][fg];"
+                    "[bg]scale=1080:1920:force_original_aspect_ratio=increase,"
+                    "crop=1080:1920,boxblur=20:5[blurred];"
+                    "[fg]scale=1080:-2:force_original_aspect_ratio=decrease[scaled];"
+                    "[blurred][scaled]overlay=(W-w)/2:(H-h)/2[out]"
+                )
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", str(clip_path),
+                    "-filter_complex", vf_vertical,
+                    "-map", "[out]", "-map", "0:a",
+                    "-c:v", "libx264", "-c:a", "aac",
+                    str(reel_nosub)
+                ], capture_output=True, check=True)
+
+                # queimar legenda no reel
+                reel_path = out_base / "reel.mp4"
+                srt_escaped = str(clip_srt_path).replace("\\", "/").replace(":", "\\:")
+                vf_sub = (
+                    f"subtitles='{srt_escaped}':force_style='"
+                    "FontSize=16,Bold=1,Alignment=2,"
+                    "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+                    "Outline=2,Shadow=1,MarginV=60'"
+                )
+                result = subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", str(reel_nosub),
+                    "-vf", vf_sub,
+                    "-c:v", "libx264", "-c:a", "aac",
+                    str(reel_path)
+                ], capture_output=True)
+                # se falhar na legenda, usa o reel sem legenda mesmo
+                if result.returncode != 0:
+                    reel_path = reel_nosub
 
         # ── 6. Gerar transcrição TXT e legenda SRT ────────────────────────
         job_data = _job(job_id)
@@ -327,6 +393,7 @@ def run_export(job_id: str, approved_cuts, video_path: Path, make_clip: bool):
             msg="Tudo pronto!",
             output_video=str(final_path),
             output_clip=str(clip_path) if clip_path else None,
+            output_reel=str(reel_path) if reel_path else None,
             output_transcript=str(transcript_path),
             output_srt=str(srt_path),
         )
@@ -505,6 +572,7 @@ async def download(job_id: str, type: str):
     paths = {
         "video":      job.get("output_video"),
         "clip":       job.get("output_clip"),
+        "reel":       job.get("output_reel"),
         "transcript": job.get("output_transcript"),
         "srt":        job.get("output_srt"),
     }
@@ -515,6 +583,7 @@ async def download(job_id: str, type: str):
     names = {
         "video":      "podcast_editado.mp4",
         "clip":       "clip_redes.mp4",
+        "reel":       "reel.mp4",
         "transcript": "transcricao.txt",
         "srt":        "legenda.srt",
     }
@@ -1548,7 +1617,7 @@ body::before {
 #downloads-section { display:none; animation:fadeUp .5s both; padding:56px 0 }
 
 .dl-grid {
-  display:grid; grid-template-columns:repeat(4,1fr);
+  display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
   gap:2px;
 }
 
@@ -2256,10 +2325,11 @@ function showDownloads(job) {
   document.getElementById('downloads-section').style.display='block';
   setStatus('pronto');
   const items=[
-    {type:'video',      n:'01',icon:'🎬',title:'Podcast Editado',  sub:'Vídeo final com vinheta',    avail:!!job.output_video},
-    {type:'clip',       n:'02',icon:'📱',title:'Clip para Redes',  sub:'60–90s do melhor momento',   avail:!!job.output_clip},
-    {type:'transcript', n:'03',icon:'📝',title:'Transcrição',      sub:'Texto completo do episódio', avail:!!job.output_transcript},
-    {type:'srt',        n:'04',icon:'💬',title:'Legenda',          sub:'Arquivo .srt para YouTube',  avail:!!job.output_srt},
+    {type:'video',      n:'01',icon:'🎬',title:'Podcast Editado',  sub:'Vídeo final com vinheta',       avail:!!job.output_video},
+    {type:'clip',       n:'02',icon:'📱',title:'Clip Horizontal',  sub:'16:9 — melhor momento',         avail:!!job.output_clip},
+    {type:'reel',       n:'03',icon:'🎞',title:'Reel Vertical',    sub:'9:16 — Instagram / TikTok',     avail:!!job.output_reel},
+    {type:'transcript', n:'04',icon:'📝',title:'Transcrição',      sub:'Texto completo do episódio',    avail:!!job.output_transcript},
+    {type:'srt',        n:'05',icon:'💬',title:'Legenda',          sub:'Arquivo .srt para YouTube',     avail:!!job.output_srt},
   ];
   document.getElementById('dlGrid').innerHTML=items.filter(i=>i.avail).map(i=>`
     <div class="dl-card">
