@@ -64,6 +64,24 @@ def ts_human(seconds):
     s = int(seconds % 60)
     return f"{m:02d}:{s:02d}"
 
+def ts_srt(seconds):
+    """Float seconds → HH:MM:SS,mmm para SRT"""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds % 1) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def generate_srt(segments):
+    """Converte segmentos do Whisper em string no formato SRT"""
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        lines.append(str(i))
+        lines.append(f"{ts_srt(seg['start'])} --> {ts_srt(seg['end'])}")
+        lines.append(seg['text'])
+        lines.append("")
+    return "\n".join(lines)
+
 # ─── PIPELINE ─────────────────────────────────────────────────────────────────
 
 def run_whisper(video_path: Path, job_id: str):
@@ -294,11 +312,14 @@ def run_export(job_id: str, approved_cuts, video_path: Path, make_clip: bool):
                     str(clip_path)
                 ], capture_output=True, check=True)
 
-        # ── 6. Gerar transcrição TXT ──────────────────────────────────────
-        transcript_path = out_base / "transcricao.txt"
+        # ── 6. Gerar transcrição TXT e legenda SRT ────────────────────────
         job_data = _job(job_id)
+        transcript_path = out_base / "transcricao.txt"
+        srt_path = out_base / "legenda.srt"
         if job_data and "transcript" in job_data:
             transcript_path.write_text(job_data["transcript"])
+        if job_data and "segments" in job_data:
+            srt_path.write_text(generate_srt(job_data["segments"]))
 
         _update(job_id,
             status="done",
@@ -307,6 +328,7 @@ def run_export(job_id: str, approved_cuts, video_path: Path, make_clip: bool):
             output_video=str(final_path),
             output_clip=str(clip_path) if clip_path else None,
             output_transcript=str(transcript_path),
+            output_srt=str(srt_path),
         )
 
     except subprocess.CalledProcessError as e:
@@ -484,6 +506,7 @@ async def download(job_id: str, type: str):
         "video":      job.get("output_video"),
         "clip":       job.get("output_clip"),
         "transcript": job.get("output_transcript"),
+        "srt":        job.get("output_srt"),
     }
     path = paths.get(type)
     if not path or not Path(path).exists():
@@ -493,6 +516,7 @@ async def download(job_id: str, type: str):
         "video":      "podcast_editado.mp4",
         "clip":       "clip_redes.mp4",
         "transcript": "transcricao.txt",
+        "srt":        "legenda.srt",
     }
     return FileResponse(path, filename=names.get(type, "download"))
 
@@ -1524,7 +1548,7 @@ body::before {
 #downloads-section { display:none; animation:fadeUp .5s both; padding:56px 0 }
 
 .dl-grid {
-  display:grid; grid-template-columns:repeat(3,1fr);
+  display:grid; grid-template-columns:repeat(4,1fr);
   gap:2px;
 }
 
@@ -2232,9 +2256,10 @@ function showDownloads(job) {
   document.getElementById('downloads-section').style.display='block';
   setStatus('pronto');
   const items=[
-    {type:'video',      n:'01',icon:'🎬',title:'Podcast Editado',  sub:'Vídeo final com vinheta',   avail:!!job.output_video},
-    {type:'clip',       n:'02',icon:'📱',title:'Clip para Redes',  sub:'60–90s do melhor momento',  avail:!!job.output_clip},
-    {type:'transcript', n:'03',icon:'📝',title:'Transcrição',      sub:'Texto completo do episódio',avail:!!job.output_transcript},
+    {type:'video',      n:'01',icon:'🎬',title:'Podcast Editado',  sub:'Vídeo final com vinheta',    avail:!!job.output_video},
+    {type:'clip',       n:'02',icon:'📱',title:'Clip para Redes',  sub:'60–90s do melhor momento',   avail:!!job.output_clip},
+    {type:'transcript', n:'03',icon:'📝',title:'Transcrição',      sub:'Texto completo do episódio', avail:!!job.output_transcript},
+    {type:'srt',        n:'04',icon:'💬',title:'Legenda',          sub:'Arquivo .srt para YouTube',  avail:!!job.output_srt},
   ];
   document.getElementById('dlGrid').innerHTML=items.filter(i=>i.avail).map(i=>`
     <div class="dl-card">
