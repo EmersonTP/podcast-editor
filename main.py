@@ -589,6 +589,358 @@ async def download(job_id: str, type: str):
     }
     return FileResponse(path, filename=names.get(type, "download"))
 
+# ─── CARROSSEL ────────────────────────────────────────────────────────────────
+
+CAROUSEL_HTML = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carrossel — Emerson</title>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<style>
+:root {
+  --laranja: #E8714A;
+  --bege:    #FAF0E4;
+  --roxo:    #7B35AC;
+  --escuro:  #1A1010;
+  --branco:  #FFFFFF;
+  --font:    'Plus Jakarta Sans', sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#fff;font-family:var(--font);min-height:100vh;display:flex;flex-direction:column}
+
+/* NAV */
+#topbar{display:flex;align-items:center;gap:16px;padding:14px 28px;border-bottom:1px solid #222;background:#0a0a0a}
+.tb-logo{font-size:13px;font-style:italic;font-weight:800;color:var(--laranja);letter-spacing:-.02em}
+.tb-logo span{color:#888;font-style:normal;font-weight:400;margin:0 6px}
+.tb-logo b{color:#fff;font-style:normal}
+.tb-back{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#555;text-decoration:none;padding:6px 12px;border:1px solid #333;border-radius:4px;transition:color .2s,border-color .2s}
+.tb-back:hover{color:#fff;border-color:#555}
+
+/* LAYOUT */
+#app{display:grid;grid-template-columns:380px 1fr;flex:1;overflow:hidden}
+
+/* PAINEL ESQUERDO */
+#panel{padding:32px 28px;border-right:1px solid #1a1a1a;overflow-y:auto;background:#0d0d0d}
+.p-section{margin-bottom:28px}
+.p-label{font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:#555;margin-bottom:8px}
+.p-title{font-size:20px;font-weight:800;letter-spacing:-.04em;margin-bottom:20px}
+textarea,input[type=text]{width:100%;background:#161616;border:1px solid #2a2a2a;color:#fff;font-family:var(--font);font-size:13px;padding:12px;border-radius:6px;resize:vertical;outline:none;transition:border-color .2s}
+textarea:focus,input[type=text]:focus{border-color:#444}
+textarea{min-height:80px}
+.btn-gen{width:100%;padding:14px;background:var(--laranja);color:#fff;font-family:var(--font);font-size:13px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;border:none;border-radius:6px;cursor:pointer;transition:opacity .2s}
+.btn-gen:hover{opacity:.85}
+.btn-gen:disabled{opacity:.4;cursor:not-allowed}
+.hint{font-size:11px;color:#444;margin-top:8px;line-height:1.5}
+#status-msg{font-size:12px;color:var(--laranja);margin-top:12px;min-height:18px}
+.divider{border:none;border-top:1px solid #1a1a1a;margin:24px 0}
+
+/* SLIDES AREA */
+#slides-area{padding:32px;overflow-y:auto;background:#0d0d0d}
+.slides-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+.slides-title{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#444}
+.btn-dl-all{font-size:11px;letter-spacing:.08em;text-transform:uppercase;background:transparent;border:1px solid #2a2a2a;color:#888;padding:8px 16px;border-radius:4px;cursor:pointer;font-family:var(--font);transition:all .2s}
+.btn-dl-all:hover{border-color:#555;color:#fff}
+#slides-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.slide-wrap{position:relative}
+.slide-preview{width:320px;height:320px;overflow:hidden;border-radius:4px;cursor:default}
+.slide-preview .slide-inner{width:1080px;height:1080px;transform:scale(0.2963);transform-origin:top left;position:relative;font-family:var(--font)}
+.slide-meta{display:flex;align-items:center;justify-content:space-between;margin-top:8px}
+.slide-num{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#444}
+.btn-dl-slide{font-size:10px;letter-spacing:.06em;text-transform:uppercase;background:transparent;border:1px solid #222;color:#555;padding:5px 10px;border-radius:3px;cursor:pointer;font-family:var(--font);transition:all .2s}
+.btn-dl-slide:hover{border-color:#444;color:#fff}
+#empty-state{text-align:center;padding:80px 40px;color:#333}
+#empty-state .es-icon{font-size:48px;margin-bottom:16px}
+#empty-state p{font-size:13px;color:#444;line-height:1.6}
+
+/* ── SLIDES ───────────────────────────────────────── */
+.slide-inner{display:flex;flex-direction:column}
+
+/* Capa */
+.s-capa{background:var(--laranja);padding:80px;justify-content:space-between}
+.s-capa .logo{font-size:28px;font-weight:800;font-style:italic;color:rgba(255,255,255,.4);letter-spacing:-.02em}
+.s-capa .logo b{font-style:normal;margin-left:6px;color:rgba(255,255,255,.5);font-weight:600}
+.s-capa .titulo{font-size:88px;font-weight:800;color:#fff;line-height:1;letter-spacing:-.04em;flex:1;display:flex;align-items:center}
+.s-capa .subtitulo{font-size:32px;font-weight:500;color:rgba(255,255,255,.7);line-height:1.4}
+
+/* Gancho */
+.s-gancho{background:var(--bege);padding:80px;justify-content:center;gap:40px}
+.s-gancho .n{font-size:200px;font-weight:800;color:var(--laranja);opacity:.12;line-height:1;position:absolute;bottom:40px;right:60px}
+.s-gancho .pergunta{font-size:72px;font-weight:800;color:var(--roxo);line-height:1.1;letter-spacing:-.04em;position:relative;z-index:1}
+.s-gancho .resp{font-size:34px;font-weight:500;color:var(--escuro);opacity:.6;line-height:1.5;position:relative;z-index:1}
+
+/* Insight */
+.s-insight-laranja{background:var(--laranja);padding:80px;justify-content:space-between}
+.s-insight-roxo{background:var(--roxo);padding:80px;justify-content:space-between}
+.s-insight-bege{background:var(--bege);padding:80px;justify-content:space-between}
+.s-insight-laranja .n,.s-insight-roxo .n{font-size:44px;font-weight:800;color:rgba(255,255,255,.3);letter-spacing:-.02em}
+.s-insight-bege .n{font-size:44px;font-weight:800;color:var(--laranja);opacity:.4;letter-spacing:-.02em}
+.s-insight-laranja .titulo,.s-insight-roxo .titulo{font-size:80px;font-weight:800;color:#fff;line-height:1.05;letter-spacing:-.04em;flex:1;display:flex;align-items:center}
+.s-insight-bege .titulo{font-size:80px;font-weight:800;color:var(--roxo);line-height:1.05;letter-spacing:-.04em;flex:1;display:flex;align-items:center}
+.s-insight-laranja .desc,.s-insight-roxo .desc{font-size:32px;font-weight:500;color:rgba(255,255,255,.75);line-height:1.5}
+.s-insight-bege .desc{font-size:32px;font-weight:500;color:var(--escuro);opacity:.6;line-height:1.5}
+
+/* Frase */
+.s-frase{background:var(--bege);padding:80px;justify-content:center;gap:36px}
+.s-frase .aspas{font-size:180px;font-weight:800;color:var(--laranja);line-height:.7;opacity:.25;font-style:italic}
+.s-frase .texto{font-size:60px;font-weight:700;color:var(--roxo);line-height:1.2;letter-spacing:-.03em}
+.s-frase .fonte{font-size:28px;font-weight:500;color:var(--laranja)}
+
+/* CTA */
+.s-cta{background:var(--roxo);padding:80px;justify-content:space-between;align-items:flex-start}
+.s-cta .logo{font-size:28px;font-weight:800;font-style:italic;color:rgba(255,255,255,.3);letter-spacing:-.02em}
+.s-cta .logo b{font-style:normal;margin-left:6px;color:rgba(255,255,255,.3);font-weight:600}
+.s-cta .texto{font-size:72px;font-weight:800;color:#fff;line-height:1.1;letter-spacing:-.04em;flex:1;display:flex;align-items:center}
+.s-cta .btn{background:var(--laranja);color:#fff;font-size:36px;font-weight:700;padding:28px 60px;border-radius:120px;letter-spacing:.02em;display:inline-block}
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <a class="tb-back" href="/">← Podcast Editor</a>
+  <div class="tb-logo">e·<b>emerson</b> <span>/</span> carrossel</div>
+</div>
+
+<div id="app">
+  <div id="panel">
+    <div class="p-label">Gerador de Carrossel</div>
+    <div class="p-title">Instagram</div>
+
+    <div class="p-section">
+      <div class="p-label">Tema / Assunto</div>
+      <input type="text" id="inp-tema" placeholder="Ex: como lidar com a recaída no álcool">
+    </div>
+
+    <div class="p-section">
+      <div class="p-label">Insights principais (opcional)</div>
+      <textarea id="inp-insights" placeholder="Cole aqui pontos-chave, frases do episódio, ou deixe em branco para a IA criar do zero"></textarea>
+      <div class="hint">Se você processou um podcast hoje, cole a transcrição ou os destaques aqui.</div>
+    </div>
+
+    <button class="btn-gen" id="btn-gerar" onclick="gerarCarrossel()">✦ Gerar carrossel</button>
+    <div id="status-msg"></div>
+
+    <hr class="divider">
+
+    <div class="p-section">
+      <div class="p-label">Dica de uso</div>
+      <div class="hint">O gerador cria 7 slides no padrão Emerson: capa · gancho · 3 insights · frase de impacto · CTA. Cada slide pode ser baixado como PNG 1080×1080 pronto para o Instagram.</div>
+    </div>
+  </div>
+
+  <div id="slides-area">
+    <div class="slides-header">
+      <div class="slides-title">Preview dos slides</div>
+      <button class="btn-dl-all" id="btn-dl-all" onclick="baixarTodos()" style="display:none">⬇ Baixar todos</button>
+    </div>
+    <div id="empty-state">
+      <div class="es-icon">✦</div>
+      <p>Digite um tema e clique em<br><strong>Gerar carrossel</strong> para começar.</p>
+    </div>
+    <div id="slides-grid" style="display:none"></div>
+    <!-- slides ocultos em tamanho real para exportação -->
+    <div id="slides-export" style="position:absolute;top:-9999px;left:-9999px;pointer-events:none"></div>
+  </div>
+</div>
+
+<script>
+const COR = {laranja:'#E8714A', bege:'#FAF0E4', roxo:'#7B35AC', branco:'#FFFFFF', escuro:'#1A1010'};
+
+let slidesData = [];
+
+async function gerarCarrossel() {
+  const tema = document.getElementById('inp-tema').value.trim();
+  if (!tema) { setMsg('Digite um tema primeiro.'); return; }
+  const insights = document.getElementById('inp-insights').value.trim();
+  const btn = document.getElementById('btn-gerar');
+  btn.disabled = true;
+  setMsg('✦ Gerando conteúdo com IA...');
+  try {
+    const r = await fetch('/api/carousel/generate', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({tema, insights})
+    });
+    const data = await r.json();
+    if (data.error) { setMsg('Erro: ' + data.error); return; }
+    slidesData = data.slides;
+    renderSlides(slidesData);
+    setMsg('');
+  } catch(e) {
+    setMsg('Erro ao gerar: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function setMsg(m) { document.getElementById('status-msg').textContent = m; }
+
+function logoHTML(opacity='.35') {
+  return `<div style="font-size:28px;font-weight:800;font-style:italic;color:rgba(255,255,255,${opacity});letter-spacing:-.02em">e·<span style="font-style:normal;margin-left:4px;font-weight:600">emerson</span></div>`;
+}
+
+function renderSlideHTML(s, idx) {
+  const types = {
+    capa: renderCapa,
+    gancho: renderGancho,
+    insight: renderInsight,
+    frase: renderFrase,
+    cta: renderCTA,
+  };
+  const fn = types[s.tipo] || renderCapa;
+  return fn(s, idx);
+}
+
+function renderCapa(s) {
+  return `<div class="slide-inner s-capa" style="font-family:'Plus Jakarta Sans',sans-serif">
+    ${logoHTML()}
+    <div class="titulo">${s.titulo||''}</div>
+    <div class="subtitulo">${s.subtitulo||''}</div>
+  </div>`;
+}
+function renderGancho(s) {
+  return `<div class="slide-inner s-gancho" style="font-family:'Plus Jakarta Sans',sans-serif;position:relative">
+    <div class="pergunta">${s.pergunta||s.texto||''}</div>
+    <div class="resp">${s.resposta||''}</div>
+    <div class="n">${s.numero||'01'}</div>
+  </div>`;
+}
+function renderInsight(s) {
+  const cores = ['laranja','roxo','bege'];
+  const c = cores[(parseInt(s.numero||1)-1) % 3];
+  return `<div class="slide-inner s-insight-${c}" style="font-family:'Plus Jakarta Sans',sans-serif">
+    <div class="n">${String(s.numero||'').padStart(2,'0')}</div>
+    <div class="titulo">${s.titulo||''}</div>
+    <div class="desc">${s.descricao||''}</div>
+  </div>`;
+}
+function renderFrase(s) {
+  return `<div class="slide-inner s-frase" style="font-family:'Plus Jakarta Sans',sans-serif">
+    <div class="aspas">"</div>
+    <div class="texto">${s.texto||''}</div>
+    <div class="fonte">${s.autor||'— emerson'}</div>
+  </div>`;
+}
+function renderCTA(s) {
+  return `<div class="slide-inner s-cta" style="font-family:'Plus Jakarta Sans',sans-serif">
+    ${logoHTML('.25')}
+    <div class="texto">${s.texto||''}</div>
+    <div class="btn">${s.cta||'link na bio'}</div>
+  </div>`;
+}
+
+function renderSlides(slides) {
+  document.getElementById('empty-state').style.display='none';
+  const grid = document.getElementById('slides-grid');
+  grid.style.display='grid';
+  grid.innerHTML = '';
+  const exp = document.getElementById('slides-export');
+  exp.innerHTML = '';
+
+  slides.forEach((s, i) => {
+    const html = renderSlideHTML(s, i);
+    // preview
+    const wrap = document.createElement('div');
+    wrap.className='slide-wrap';
+    wrap.innerHTML = `
+      <div class="slide-preview" id="prev-${i}">${html}</div>
+      <div class="slide-meta">
+        <div class="slide-num">slide ${String(i+1).padStart(2,'0')}</div>
+        <button class="btn-dl-slide" onclick="baixarSlide(${i})">⬇ PNG</button>
+      </div>`;
+    grid.appendChild(wrap);
+    // export (full 1080x1080)
+    const exp_div = document.createElement('div');
+    exp_div.id = `exp-${i}`;
+    exp_div.style.cssText='width:1080px;height:1080px;position:absolute;font-family:"Plus Jakarta Sans",sans-serif';
+    exp_div.innerHTML = html;
+    exp.appendChild(exp_div);
+  });
+
+  document.getElementById('btn-dl-all').style.display='block';
+}
+
+async function baixarSlide(idx) {
+  await document.fonts.ready;
+  const el = document.getElementById(`exp-${idx}`);
+  const canvas = await html2canvas(el, {
+    width:1080, height:1080, scale:1,
+    useCORS:true, allowTaint:true,
+    backgroundColor: null,
+    logging: false,
+  });
+  const a = document.createElement('a');
+  a.download = `emerson-slide-${String(idx+1).padStart(2,'0')}.png`;
+  a.href = canvas.toDataURL('image/png');
+  a.click();
+}
+
+async function baixarTodos() {
+  await document.fonts.ready;
+  for(let i=0; i<slidesData.length; i++) {
+    await baixarSlide(i);
+    await new Promise(r=>setTimeout(r,300));
+  }
+}
+</script>
+</body>
+</html>"""
+
+@app.get("/carousel", response_class=HTMLResponse)
+async def carousel_page():
+    return HTMLResponse(CAROUSEL_HTML)
+
+@app.post("/api/carousel/generate")
+async def carousel_generate(request: Request):
+    body = await request.json()
+    tema     = body.get("tema", "")
+    insights = body.get("insights", "")
+    if not ANTHROPIC_KEY:
+        return JSONResponse({"error": "ANTHROPIC_API_KEY não configurada"}, status_code=400)
+    if not tema:
+        return JSONResponse({"error": "Tema obrigatório"}, status_code=400)
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        contexto_insights = f"\n\nINSIGHTS / CONTEÚDO FORNECIDO:\n{insights}" if insights else ""
+        prompt = f"""Você é o redator criativo da Emerson Health, clínica digital focada em álcool, nicotina e apostas.
+Crie conteúdo para um carrossel de Instagram com 7 slides sobre: {tema}{contexto_insights}
+
+Tom: humano, direto, sem julgamento, empático — igual ao brandbook Emerson.
+Linguagem: português brasileiro coloquial mas inteligente.
+
+Retorne APENAS JSON válido, sem markdown, sem explicação:
+{{
+  "slides": [
+    {{"tipo":"capa",    "titulo":"título impactante curto (máx 6 palavras)", "subtitulo":"complemento em 1 linha"}},
+    {{"tipo":"gancho",  "numero":"01", "pergunta":"pergunta que gera identificação", "resposta":"resposta curta que surpreende"}},
+    {{"tipo":"insight", "numero":"1",  "titulo":"insight 1 curto bold", "descricao":"1-2 frases explicando"}},
+    {{"tipo":"insight", "numero":"2",  "titulo":"insight 2 curto bold", "descricao":"1-2 frases explicando"}},
+    {{"tipo":"insight", "numero":"3",  "titulo":"insight 3 curto bold", "descricao":"1-2 frases explicando"}},
+    {{"tipo":"frase",   "texto":"frase de impacto do tema (20-40 palavras)", "autor":"— emerson"}},
+    {{"tipo":"cta",     "texto":"convite à ação relacionado ao tema", "cta":"link na bio"}}
+  ]
+}}"""
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role":"user","content":prompt}]
+        )
+        raw = msg.content[0].text.strip()
+        # limpa possível markdown
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw.strip())
+        return JSONResponse(data)
+    except json.JSONDecodeError as e:
+        return JSONResponse({"error": f"JSON inválido: {e}"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 # ─── BACKGROUND ───────────────────────────────────────────────────────────────
 
 def process_job(job_id: str, video_path: Path, duration: float):
@@ -1808,6 +2160,7 @@ body::before {
     <div class="topbar-app">podcast editor</div>
   </div>
   <div class="topbar-spacer"></div>
+  <a class="btn-topbar" href="/carousel" style="text-decoration:none">✦ Carrossel</a>
   <button class="btn-topbar" onclick="document.getElementById('jingleModal').classList.add('open')">⚡ Vinheta</button>
   <div class="topbar-status">
     <div class="status-dot" id="statusDot"></div>
